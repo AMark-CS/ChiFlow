@@ -125,6 +125,8 @@ class Sampler:
         )
         if conf.model.model_name == "ff1":
             self._load_ckpt_ff1(weights_pkl, conf_overrides)
+        elif conf.model.model_name == "chiflow":
+            self._load_ckpt_chiflow(weights_pkl, conf_overrides)
         else:
             deps = FF2Dependencies(conf)
             self.model = FF2Model.from_ckpt(weights_pkl, deps)
@@ -170,6 +172,38 @@ class Sampler:
         }
         self.model.load_state_dict(model_weights)
         self.flow_matcher = self.exp.flow_matcher
+
+    def _load_ckpt_chiflow(self, weights_pkl, conf_overrides):
+        """Loads ChiFlow model checkpoint."""
+        self._log.info(f"Loading ChiFlow weights from {self._weights_path}")
+
+        # Import ChiFlow model
+        from foldflow.models.chiflow import ChiFlowModel
+
+        # Merge config if available
+        try:
+            if "conf" in weights_pkl:
+                self._conf.model = OmegaConf.merge(
+                    self._conf.model, weights_pkl["conf"].model
+                )
+        except (AttributeError, KeyError):
+            print("Checkpoint does not have model config. Skipping merge.")
+
+        if conf_overrides is not None:
+            self._conf = OmegaConf.merge(self._conf, conf_overrides)
+
+        # Create ChiFlow model
+        self.model = ChiFlowModel(self._conf.model)
+
+        # Load model weights
+        if "model" in weights_pkl:
+            model_weights = weights_pkl["model"]
+            model_weights = {k.replace("module.", ""): v for k, v in model_weights.items()}
+            self.model.load_state_dict(model_weights, strict=True)
+
+        # For ChiFlow, we don't need the traditional flow matcher
+        self.flow_matcher = None
+        self.exp = None  # ChiFlow doesn't use the traditional Experiment class
 
     def run_sampling(self):
         """Sets up inference run.
@@ -394,46 +428,93 @@ class Sampler:
             sample_length: length to sample
 
         Returns:
-            Sample outputs. See train.inference_fn.
+            Sample outputs with dihedrals and backbone coordinates.
         """
-        # Process motif features.
-        res_mask = np.ones(sample_length)
-        fixed_mask = np.zeros_like(res_mask)
-        aatype = torch.zeros(sample_length, dtype=torch.int32)
-        chain_idx = torch.zeros_like(aatype)
+        if self._conf.model.model_name == "chiflow":
+            # ChiFlow sampling using high-dimensional torus flow + NERF
+            # Create batch with dihedral angles
+            batch = {
+                'dihedrals': torch.zeros(1, sample_length, 3, device=self.device),  # (B, L, 3) for phi, psi, omega
+                'aatype': torch.zeros(1, sample_length, dtype=torch.long, device=self.device),
+                'atom_positions': torch.zeros(1, sample_length, 37, 3, device=self.device),  # atom37
+                'atom_mask': torch.ones(1, sample_length, 37, device=self.device),
+                'res_mask': torch.ones(1, sample_length, device=self.device),
+            }
 
-        # Initialize data
-        ref_sample = self.flow_matcher.sample_ref(
-            n_samples=sample_length,
-            as_tensor_7=True,
-        )
-        res_idx = torch.arange(1, sample_length + 1)
-        init_feats = {
-            "res_mask": res_mask,
-            "seq_idx": res_idx,
-            "fixed_mask": fixed_mask,
-            "torsion_angles_sin_cos": np.zeros((sample_length, 7, 2)),
-            "sc_ca_t": np.zeros((sample_length, 3)),
-            "aatype": aatype,
-            "chain_idx": chain_idx,
-            **ref_sample,
-        }
-        # Add batch dimension and move to GPU.
-        init_feats = tree.map_structure(
-            lambda x: x if torch.is_tensor(x) else torch.tensor(x), init_feats
-        )
-        init_feats = tree.map_structure(lambda x: x[None].to(self.device), init_feats)
+            # Sample using ChiFlow model
+            sample_out = self.model.sample(
+                batch,
+                num_steps=self._fm_conf.num_t
+            )
 
-        # Run inference
-        sample_out = self.exp.inference_fn(
-            init_feats,
-            num_t=self._fm_conf.num_t,
-            min_t=self._fm_conf.min_t,
-            aux_traj=True,
-            noise_scale=self._fm_conf.noise_scale,
-            context=context,
-        )
-        return tree.map_structure(lambda x: x[:, 0], sample_out)
+            # Convert to expected format for compatibility
+            # Extract backbone coordinates (N, CA, C atoms)
+            backbone_coords = sample_out['backbone_coords'][0]  # (L, 3, 3)
+
+            # Create mock rigid transformations for compatibility
+            from openfold.utils import rigid_utils as ru
+            rigids = []
+            for i in range(sample_length):
+                # Create rigid transformation from N, CA, C positions
+                n_pos = backbone_coords[i, 0]  # N
+                ca_pos = backbone_coords[i, 1]  # CA
+                c_pos = backbone_coords[i, 2]   # C
+
+                # Simple rigid transformation (identity for now)
+                rot = torch.eye(3, device=self.device)
+                trans = ca_pos
+                rigid = ru.Rigid.from_tensor_4x4(torch.eye(4, device=self.device))
+                rigids.append(rigid)
+
+            rigids_t = ru.Rigid.from_tensor_4x4(torch.stack([r.to_tensor_4x4() for r in rigids]))
+
+            return {
+                'prot_traj': backbone_coords.unsqueeze(0),  # Add batch dimension
+                'rigid_0_traj': rigids_t.to_tensor_7().unsqueeze(0),
+                'rigid_traj': rigids_t.to_tensor_7().unsqueeze(0).unsqueeze(0).repeat(1, self._fm_conf.num_t, 1, 1),
+                'trans_traj': trans.unsqueeze(0).unsqueeze(0).repeat(1, self._fm_conf.num_t, 1, 1),
+                'psi_pred': torch.zeros(1, 1, sample_length, device=self.device),
+            }
+        else:
+            # Original sampling for SE(3) flow models
+            # Process motif features.
+            res_mask = np.ones(sample_length)
+            fixed_mask = np.zeros_like(res_mask)
+            aatype = torch.zeros(sample_length, dtype=torch.int32)
+            chain_idx = torch.zeros_like(aatype)
+
+            # Initialize data
+            ref_sample = self.flow_matcher.sample_ref(
+                n_samples=sample_length,
+                as_tensor_7=True,
+            )
+            res_idx = torch.arange(1, sample_length + 1)
+            init_feats = {
+                "res_mask": res_mask,
+                "seq_idx": res_idx,
+                "fixed_mask": fixed_mask,
+                "torsion_angles_sin_cos": np.zeros((sample_length, 7, 2)),
+                "sc_ca_t": np.zeros((sample_length, 3)),
+                "aatype": aatype,
+                "chain_idx": chain_idx,
+                **ref_sample,
+            }
+            # Add batch dimension and move to GPU.
+            init_feats = tree.map_structure(
+                lambda x: x if torch.is_tensor(x) else torch.tensor(x), init_feats
+            )
+            init_feats = tree.map_structure(lambda x: x[None].to(self.device), init_feats)
+
+            # Run inference
+            sample_out = self.exp.inference_fn(
+                init_feats,
+                num_t=self._fm_conf.num_t,
+                min_t=self._fm_conf.min_t,
+                aux_traj=True,
+                noise_scale=self._fm_conf.noise_scale,
+                context=context,
+            )
+            return tree.map_structure(lambda x: x[:, 0], sample_out)
 
 
 @hydra.main(version_base=None, config_path="config/", config_name="inference")

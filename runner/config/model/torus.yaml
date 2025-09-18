@@ -1,0 +1,43 @@
+# Configuration for ChiFlow model using high-dimensional torus flow
+model_name: "chiflow"
+
+# High-dimensional torus flow configuration
+flow:
+  num_hidden_dims: 512
+  num_hidden_layers: 4
+  num_mixtures: 3
+
+# Feature dimensions
+residue_feat_dim: 256
+pair_feat_dim: 128
+n_context_dims: 256
+time_embed_dim: 64
+
+# Encoder configurations
+residue_encoder:
+  feat_dim: ${model.residue_feat_dim}
+  max_num_atoms: 37  # Standard atom37 representation
+  num_aa_types: 21   # Standard amino acid types
+
+pair_encoder:
+  feat_dim: ${model.pair_feat_dim}
+  max_num_residues: 512
+
+# Context network
+context_net:
+  hidden_dim: ${model.n_context_dims}
+
+# Time embedding
+time_embed:
+  dim: ${model.time_embed_dim}
+
+# Sampling parameters
+sampling:
+  num_steps: 100
+  noise_scale: 0.1
+
+# Training parameters
+training:
+  batch_size: 4
+  learning_rate: 1e-4
+  num_epochs: 100
