@@ -28,6 +28,11 @@ class HighDimTorusFlow(nn.Module):
                 'num_mixtures': 3
             })()
 
+        # Add stochastic paths support
+        self.stochastic_paths = getattr(cfg_flow, 'stochastic_paths', False)
+        self.g = getattr(cfg_flow, 'g', 0.1)
+        self.min_sigma = getattr(cfg_flow, 'min_sigma', 0.01)
+
         # Vector field network for each dihedral angle
         self.vector_field_nets = nn.ModuleList([
             LeakyMLP(
@@ -39,6 +44,12 @@ class HighDimTorusFlow(nn.Module):
         ])
 
         self.num_mixtures = cfg_flow.num_mixtures
+
+    def compute_sigma_t(self, t):
+        """Compute noise scale for stochastic paths."""
+        if isinstance(t, float):
+            t = torch.tensor(t)
+        return torch.sqrt(self.g**2 * t * (1 - t) + self.min_sigma**2)
 
     def forward(self, dihedrals, context, t=None, mask=None):
         """
@@ -77,6 +88,12 @@ class HighDimTorusFlow(nn.Module):
             ut = vx_t.mean(dim=-1)[:, 0]  # Take mean across mixtures, first component
             xt = angle_dihedrals + ut * dt + noise
 
+            # Add stochastic noise if enabled
+            if self.stochastic_paths:
+                epsilon_t = self.compute_sigma_t(t_tensor.mean())
+                stochastic_noise = torch.randn_like(xt) * epsilon_t
+                xt = xt + stochastic_noise
+
             # Project to torus [-pi, pi]
             xt = torch.remainder(xt + torch.pi, 2 * torch.pi) - torch.pi
 
@@ -108,6 +125,12 @@ class ChiFlowMatcher(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+
+        # Add OT and SFM support
+        self.ot_plan = getattr(cfg, 'ot_plan', False)
+        self.ot_fn = getattr(cfg, 'ot_fn', 'exact')
+        self.reg = getattr(cfg, 'reg', 0.05)
+        self.stochastic_paths = getattr(cfg, 'stochastic_paths', False)
 
         # High-dimensional toroidal flow
         self.torus_flow = HighDimTorusFlow(
@@ -145,6 +168,59 @@ class ChiFlowMatcher(nn.Module):
             nn.ReLU(),
             nn.Linear(cfg.time_embed_dim, cfg.n_context_dims)  # Match context dimension
         )
+
+        # Log configuration
+        if self.ot_plan:
+            print(f"Using OT plan with {self.ot_fn} computation.")
+        if self.stochastic_paths:
+            print("Using stochastic paths.")
+
+    def dihedral_forward_marginal(self, dihedrals_0, t, flow_mask=None, dihedrals_1=None):
+        """
+        Forward marginal for ChiFlow with dihedral angles.
+        dihedrals_0: (B, L, 3) ground truth dihedral angles
+        t: time step
+        flow_mask: (B, L) mask for flowed positions
+        dihedrals_1: (B, L, 3) noise dihedral angles (optional)
+        """
+        # Create batch with dihedral angles
+        batch = {
+            'dihedrals': dihedrals_0,
+            'aatype': torch.zeros(dihedrals_0.shape[0], dihedrals_0.shape[1], dtype=torch.long, device=dihedrals_0.device),
+            'atom_positions': torch.zeros(dihedrals_0.shape[0], dihedrals_0.shape[1], 37, 3, device=dihedrals_0.device),
+            'atom_mask': torch.ones(dihedrals_0.shape[0], dihedrals_0.shape[1], 37, device=dihedrals_0.device),
+            'res_mask': torch.ones(dihedrals_0.shape[0], dihedrals_0.shape[1], device=dihedrals_0.device),
+        }
+
+        # Forward pass
+        flow_output = self.forward(batch, t=torch.tensor([t], device=dihedrals_0.device))
+
+        return {
+            'dihedrals_t': flow_output['dihedral_xt'],
+            'dihedral_vectorfield': flow_output['dihedral_flow']
+        }
+
+    def forward_marginal(self, rigids_0, t, flow_mask=None, rigids_1=None):
+        """
+        Forward marginal for compatibility with existing OT code.
+        For ChiFlow, we work with dihedral angles instead of rigids.
+        This is a compatibility layer.
+        """
+        # For ChiFlow, we don't use rigids directly
+        # This method is for compatibility with existing OT code
+        # In practice, ChiFlow's OT would work differently
+        raise NotImplementedError("ChiFlow OT implementation requires dihedral angle data, not rigids")
+
+    def forward_marginal(self, rigids_0, t, flow_mask=None, rigids_1=None):
+        """
+        Forward marginal for compatibility with existing OT code.
+        For ChiFlow, we work with dihedral angles instead of rigids.
+        This is a compatibility layer.
+        """
+        # For ChiFlow, we don't use rigids directly
+        # This method is for compatibility with existing OT code
+        # In practice, ChiFlow's OT would work differently
+        raise NotImplementedError("ChiFlow OT implementation requires dihedral angle data, not rigids")
 
     def encode_context(self, batch):
         """

@@ -109,10 +109,23 @@ class Experiment:
             self._exp_conf.full_ckpt_dir = None
 
         # Initialize experiment objects
-        self._flow_matcher = se3_fm.SE3FlowMatcher(self._fm_conf)
+        if self._model_conf.model_name == "chiflow":
+            # For ChiFlow, use ChiFlowMatcher instead of SE3FlowMatcher
+            from foldflow.models.chiflow import ChiFlowMatcher
+            self._flow_matcher = ChiFlowMatcher(self._model_conf)
+        else:
+            # For SE3 models, use SE3FlowMatcher
+            self._flow_matcher = se3_fm.SE3FlowMatcher(self._fm_conf)
+
         self._model = model
         if self._model is None:
-            self._model = network.VectorFieldNetwork(self._model_conf, self.flow_matcher)
+            if self._model_conf.model_name == "chiflow":
+                # ChiFlow uses its own model architecture
+                from foldflow.models.chiflow import ChiFlowModel
+                self._model = ChiFlowModel(self._model_conf)
+            else:
+                # SE3 models use VectorFieldNetwork
+                self._model = network.VectorFieldNetwork(self._model_conf, self.flow_matcher)
             if ckpt_model is not None:
                 ckpt_model = {k.replace("module.", ""): v for k, v in ckpt_model.items()}
                 ckpt_model = {

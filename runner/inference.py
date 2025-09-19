@@ -178,7 +178,7 @@ class Sampler:
         self._log.info(f"Loading ChiFlow weights from {self._weights_path}")
 
         # Import ChiFlow model
-        from foldflow.models.chiflow import ChiFlowModel
+        from foldflow.models.chiflow import ChiFlowModel, ChiFlowMatcher
 
         # Merge config if available
         try:
@@ -192,8 +192,9 @@ class Sampler:
         if conf_overrides is not None:
             self._conf = OmegaConf.merge(self._conf, conf_overrides)
 
-        # Create ChiFlow model
+        # Create ChiFlow model and matcher
         self.model = ChiFlowModel(self._conf.model)
+        self.flow_matcher = ChiFlowMatcher(self._conf.model)
 
         # Load model weights
         if "model" in weights_pkl:
@@ -201,8 +202,7 @@ class Sampler:
             model_weights = {k.replace("module.", ""): v for k, v in model_weights.items()}
             self.model.load_state_dict(model_weights, strict=True)
 
-        # For ChiFlow, we don't need the traditional flow matcher
-        self.flow_matcher = None
+        # Create a minimal experiment for compatibility
         self.exp = None  # ChiFlow doesn't use the traditional Experiment class
 
     def run_sampling(self):

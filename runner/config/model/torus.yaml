@@ -6,6 +6,10 @@ flow:
   num_hidden_dims: 512
   num_hidden_layers: 4
   num_mixtures: 3
+  # Stochastic Flow Matching parameters
+  stochastic_paths: false
+  g: 0.1
+  min_sigma: 0.01
 
 # Feature dimensions
 residue_feat_dim: 256
@@ -30,6 +34,11 @@ context_net:
 # Time embedding
 time_embed:
   dim: ${model.time_embed_dim}
+
+# Optimal Transport parameters
+ot_plan: false
+ot_fn: "exact"  # "exact" or "sinkhorn"
+reg: 0.05      # regularization for Sinkhorn OT
 
 # Sampling parameters
 sampling:

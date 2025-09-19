@@ -19,7 +19,7 @@ experiment:
   separate_rot_loss: True
   use_ddp: False
   num_gpus: 1
-  batch_size: 11
+  batch_size: 8
   num_epoch: 2000
   ckpt_freq: 500
   eval_freq: 250

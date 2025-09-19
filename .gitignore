@@ -7,6 +7,7 @@ wandb/
 *.csv
 *.fa
 *pdbs.jsonl
+*.pt
 
 inference_outputs/
 # Byte-compiled / optimized / DLL files

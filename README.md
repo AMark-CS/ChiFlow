@@ -1,16 +1,16 @@
 # Torus Flow Matching for Protein Backbone Generation
 
 
-**Torus Flow Matching** is a generative model for protein design that focuses on dihedral angles, leveraging the toroidal geometry of these angles. This approach is part of the broader **FoldFlow** framework and introduces a specialized flow matching technique tailored for the torus manifold. For more information, see our [arXiv](https://arxiv.org/abs/2310.02391) preprint.
+**Torus Flow Matching** is a generative model for protein design that focuses on dihedral angles, leveraging the toroidal geometry of these angles. This approach is part of the broader **FoldFlow** framework and introduces a specialized flow matching technique tailored for the torus manifold. For more information, please contact hhhzhchhh939@gmail.com
 
 # Installation
 To use the Torus Flow Matching model, follow these steps to set up the environment:
-
+python=3.10
 ```bash
-git clone https://github.com/DreamFold/FoldFlow.git
-cd FoldFlow
-conda env create -f se3.yml
-conda activate se3
+git clone https://github.com/AMark-CS/ChiFlow.git
+cd ChiFlow
+conda env create -f environment.yaml
+conda activate chiflow
 pip install -e .
 ```
 
