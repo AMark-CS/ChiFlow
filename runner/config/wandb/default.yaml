@@ -1,6 +1,6 @@
 use_wandb: True
 entity: null
-project: se3-fm
+project: ChiFlow
 dir: ./
 tags: null
 group: null

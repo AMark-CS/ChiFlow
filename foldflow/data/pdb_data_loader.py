@@ -119,8 +119,8 @@ def _process_csv_row(csv, processed_file_path):
     # Run through OpenFold data transforms.
     chain_feats = {
         "aatype": torch.tensor(processed_feats["aatype"]).long(),
-        "all_atom_positions": torch.tensor(processed_feats["atom_positions"]).double(),
-        "all_atom_mask": torch.tensor(processed_feats["atom_mask"]).double(),
+        "all_atom_positions": torch.tensor(processed_feats["atom_positions"]).float(),
+        "all_atom_mask": torch.tensor(processed_feats["atom_mask"]).float(),
     }
     chain_feats = data_transforms.atom37_to_frames(chain_feats)
     chain_feats = data_transforms.make_atom14_masks(chain_feats)
@@ -156,6 +156,8 @@ def _process_csv_row(csv, processed_file_path):
         "residx_atom14_to_atom37": chain_feats["residx_atom14_to_atom37"],
         "residue_index": processed_feats["residue_index"],
         "res_mask": processed_feats["bb_mask"],
+        "atom_positions": chain_feats["all_atom_positions"],  # ChiFlow expects 'atom_positions'
+        "atom_mask": chain_feats["all_atom_mask"],  # ChiFlow expects 'atom_mask'
         "atom37_pos": chain_feats["all_atom_positions"],
         "atom37_mask": chain_feats["all_atom_mask"],
         "atom14_pos": chain_feats["atom14_gt_positions"],
@@ -516,9 +518,33 @@ class PdbDataset(data.Dataset):
         if self.is_training and not self.is_OT:
             # Sample t and flow.
             t = rng.uniform(self._data_conf.min_t, 1.0)
-            gen_feats_t = self._gen_model.forward_marginal(
-                rigids_0=gt_bb_rigid, t=t, flow_mask=None, rigids_1=None
-            )
+
+            # Check if this is ChiFlow model
+            if hasattr(self._gen_model, 'cfg') and hasattr(self._gen_model.cfg, 'model_name') and self._gen_model.cfg.model_name == 'chiflow':
+                # For ChiFlow, we need to pass dihedral data instead of rigids
+                # Convert sin/cos to angles for ChiFlow
+                torsion_sin_cos = chain_feats['torsion_angles_sin_cos'][:, :3, :]  # (seq, 3, 2) - phi, psi, omega
+                dihedrals = torch.atan2(torsion_sin_cos[:, :, 0], torsion_sin_cos[:, :, 1])  # (seq, 3)
+
+                # Add batch dimension for ChiFlow model (expects B, L, 3) and detach gradients
+                dihedrals = dihedrals.unsqueeze(0).detach()  # (1, seq, 3)
+
+                dihedral_data = {
+                    'dihedrals': dihedrals,
+                    'rigids_0': gt_bb_rigid,
+                    'aatype': chain_feats['aatype'],
+                    'res_mask': chain_feats['res_mask']
+                }
+                # Do not call the model inside the DataLoader worker (avoids CUDA init in forked subprocess).
+                # Only attach the time and dihedral data; the actual forward_marginal will be executed
+                # in the main process (training loop) where CUDA is initialized.
+                gen_feats_t = {}
+            else:
+                # Original SE3 flow matching
+                # Do not call the model inside the DataLoader worker (avoids CUDA init in forked subprocess).
+                # Only attach the time and dihedral data; the actual forward_marginal will be executed
+                # in the main process (training loop) where CUDA is initialized.
+                gen_feats_t = {}
         elif self.is_training and self.is_OT:
             t = rng.uniform(self._data_conf.min_t, 1.0)
             n_res = chain_feats["aatype"].shape[
@@ -530,9 +556,28 @@ class PdbDataset(data.Dataset):
             if n_samples == 1 or n_samples == 0:
                 # only one sample, we can't do OT
                 # self._log.info(f"Only one sample of length {n_res}, skipping OT")
-                gen_feats_t = self._gen_model.forward_marginal(
-                    rigids_0=gt_bb_rigid, t=t, flow_mask=None, rigids_1=None
-                )
+                if hasattr(self._gen_model, 'cfg') and hasattr(self._gen_model.cfg, 'model_name') and self._gen_model.cfg.model_name == 'chiflow':
+                    # For ChiFlow, pass dihedral data
+                    # Convert sin/cos to angles for ChiFlow
+                    torsion_sin_cos = chain_feats['torsion_angles_sin_cos'][:, :3, :]  # (seq, 3, 2)
+                    dihedrals = torch.atan2(torsion_sin_cos[:, :, 0], torsion_sin_cos[:, :, 1])  # (seq, 3)
+
+                    dihedral_data = {
+                        'dihedrals': dihedrals,
+                        'rigids_0': gt_bb_rigid,
+                        'aatype': chain_feats['aatype'],
+                        'res_mask': chain_feats['res_mask']
+                    }
+                    # Do not call the model inside the DataLoader worker (avoids CUDA init in forked subprocess).
+                    # Only attach the time and dihedral data; the actual forward_marginal will be executed
+                    # in the main process (training loop) where CUDA is initialized.
+                    gen_feats_t = {}
+                else:
+                    # Original SE3 flow matching
+                    # Do not call the model inside the DataLoader worker (avoids CUDA init in forked subprocess).
+                    # Only attach the time and dihedral data; the actual forward_marginal will be executed
+                    # in the main process (training loop) where CUDA is initialized.
+                    gen_feats_t = {}
             else:
                 sample_subset = subset.sample(
                     n_samples, replace=True, random_state=0
@@ -593,35 +638,39 @@ class PdbDataset(data.Dataset):
 
                 # sample using the plan
                 # pick one random indices for the pdb returned by __getitem__
-                idx_target = torch.randint(n_samples, (1,))
-                pi_target = T[idx_target].squeeze()
-                pi_target /= torch.sum(pi_target)
-                idx_source = torch.multinomial(pi_target, 1)
+                # Do not call the model inside the DataLoader worker (avoids CUDA init in forked subprocess).
+                # Only attach the time and dihedral data; the actual forward_marginal will be executed
+                # in the main process (training loop) where CUDA is initialized.
+                gen_feats_t = {}
                 paired_rot = rand_rot[idx_source].squeeze()
                 paired_trans = rand_trans[idx_source].squeeze()
-
-                rigids_1 = assemble_rigid_mat(paired_rot, paired_trans)
-
-                gen_feats_t = self._gen_model.forward_marginal(
-                    rigids_0=gt_bb_rigid, t=t, flow_mask=None, rigids_1=rigids_1
-                )
+                # For ChiFlow OT, we need to handle dihedral angles
+                # Convert sin/cos to angles for ChiFlow
+                torsion_sin_cos = chain_feats['torsion_angles_sin_cos'][:, :3, :]  # (seq, 3, 2)
+                dihedrals = torch.atan2(torsion_sin_cos[:, :, 0], torsion_sin_cos[:, :, 1])  # (seq, 3)
+                # Add batch dimension for ChiFlow model (expects B, L, 3) and detach gradients
+                dihedrals = dihedrals.unsqueeze(0).detach()  # (1, seq, 3)
+                dihedral_data = {
+                    'dihedrals': dihedrals,
+                    'rigids_0': gt_bb_rigid,
+                    'aatype': chain_feats['aatype'],
+                    'res_mask': chain_feats['res_mask']
+                }
+                # No model calls here; just placeholders
 
         else:
             t = 1.0
-            gen_feats_t = self.gen_model.sample_ref(
-                n_samples=gt_bb_rigid.shape[0],
-                impute=gt_bb_rigid,
-                flow_mask=None,
-                as_tensor_7=True,
-            )
+            # Do not call sampling inside the worker. Leave placeholder for sampling to be
+            # executed in the main process when needed.
+            gen_feats_t = {}
         chain_feats.update(gen_feats_t)
         chain_feats["t"] = t
 
-        # Convert all features to tensors.
+        # Convert all features to tensors and ensure they are on CPU
         final_feats = tree.map_structure(
-            lambda x: x if torch.is_tensor(x) else torch.tensor(x), chain_feats
+            lambda x: x.detach().cpu() if torch.is_tensor(x) else torch.tensor(x), chain_feats
         )
-        final_feats = du.pad_feats(final_feats, csv_row["modeled_seq_len"])
+        final_feats = du.pad_feats(final_feats, csv_row["modeled_seq_len"], use_torch=True)
         if self.is_training:
             return final_feats
         else:
@@ -705,17 +754,15 @@ class TrainSampler(data.Sampler):
         if self._sample_mode == "length_batch":
             # Each batch contains multiple proteins of the same length.
             sampled_order = self._data_csv.groupby("modeled_seq_len").sample(
+                1, random_state=self.epoch
+            )
+            sampled_order = sampled_order.groupby("modeled_seq_len").sample(
                 self._batch_size, replace=True, random_state=self.epoch
             )
             return iter(sampled_order["index"].tolist())
         elif self._sample_mode == "time_batch":
             # Each batch contains multiple time steps of the same protein.
-            random.shuffle(self._dataset_indices)
-            repeated_indices = np.repeat(self._dataset_indices, self._batch_size)
-            return iter(repeated_indices)
-        elif self._sample_mode == "cluster_length_batch":
-            # Each batch contains multiple clusters of the same length.
-            sampled_clusters = self._data_csv_group_clusters.sample(
+            sampled_clusters = self._data_csv.groupby("modeled_seq_len").sample(
                 1, random_state=self.epoch
             )
             sampled_order = sampled_clusters.groupby("modeled_seq_len").sample(

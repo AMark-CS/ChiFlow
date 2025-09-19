@@ -7,10 +7,10 @@ use_ddp : False
 
 # Training arguments
 log_freq: 100
-batch_size: 256
+batch_size: 4
 eval_batch_size: ${data.samples_per_eval_length}
-num_loader_workers: 12
-torch_num_threads: 8
+num_loader_workers: 2
+torch_num_threads: 4
 num_epoch: 500
 learning_rate: 0.0001
 max_squared_res: 500000

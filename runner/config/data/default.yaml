@@ -18,3 +18,5 @@ num_t: 100
 max_same_res: 50 # the number of pdb with the same number of residue to use to compute the ot plan.
 num_csv_processors: 5
 cache_full_dataset: False
+cache_dataset_in_memory: False
+cache_path: /tmp/chiflow_cache

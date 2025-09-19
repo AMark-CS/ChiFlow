@@ -1,6 +1,9 @@
 # Configuration for ChiFlow model using high-dimensional torus flow
 model_name: "chiflow"
 
+# Basic parameters
+num_aa_types: 21   # Standard amino acid types
+
 # High-dimensional torus flow configuration
 flow:
   num_hidden_dims: 512
@@ -21,7 +24,7 @@ time_embed_dim: 64
 residue_encoder:
   feat_dim: ${model.residue_feat_dim}
   max_num_atoms: 37  # Standard atom37 representation
-  num_aa_types: 21   # Standard amino acid types
+  num_aa_types: 21   # Standard amino acid types (hardcoded for compatibility)
 
 pair_encoder:
   feat_dim: ${model.pair_feat_dim}
@@ -34,6 +37,10 @@ context_net:
 # Time embedding
 time_embed:
   dim: ${model.time_embed_dim}
+
+# Mirror operator constraints
+mirror_constraint_weight: 0.1
+use_mirror_constraint: true
 
 # Optimal Transport parameters
 ot_plan: false

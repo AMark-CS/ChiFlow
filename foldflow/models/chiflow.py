@@ -140,7 +140,7 @@ class ChiFlowMatcher(nn.Module):
         )
 
         # Simple residue encoder
-        self.aa_embedding = nn.Embedding(cfg.num_aa_types, cfg.residue_feat_dim)
+        self.aa_embedding = nn.Embedding(cfg.residue_encoder.num_aa_types, cfg.residue_feat_dim)
         self.pos_encoder = nn.Linear(4, cfg.residue_feat_dim)  # position + mask
         self.res_mlp = nn.Sequential(
             nn.Linear(cfg.residue_feat_dim * 2, cfg.residue_feat_dim),
@@ -175,14 +175,19 @@ class ChiFlowMatcher(nn.Module):
         if self.stochastic_paths:
             print("Using stochastic paths.")
 
+        # Mirror operator for chirality constraints
+        self.mirror_constraint_weight = getattr(cfg, 'mirror_constraint_weight', 0.1)
+        self.use_mirror_constraint = getattr(cfg, 'use_mirror_constraint', True)
+
     def dihedral_forward_marginal(self, dihedrals_0, t, flow_mask=None, dihedrals_1=None):
         """
         Forward marginal for ChiFlow with dihedral angles.
         dihedrals_0: (B, L, 3) ground truth dihedral angles
-        t: time step
+        t: time step (scalar)
         flow_mask: (B, L) mask for flowed positions
         dihedrals_1: (B, L, 3) noise dihedral angles (optional)
         """
+        print(f"DEBUG: dihedral_forward_marginal input dihedrals_0 shape: {dihedrals_0.shape}")
         # Create batch with dihedral angles
         batch = {
             'dihedrals': dihedrals_0,
@@ -192,8 +197,11 @@ class ChiFlowMatcher(nn.Module):
             'res_mask': torch.ones(dihedrals_0.shape[0], dihedrals_0.shape[1], device=dihedrals_0.device),
         }
 
+        # Add time to batch
+        t_tensor = torch.tensor([t], device=dihedrals_0.device).expand(dihedrals_0.shape[0])
+
         # Forward pass
-        flow_output = self.forward(batch, t=torch.tensor([t], device=dihedrals_0.device))
+        flow_output = self.forward(batch, t=t_tensor)
 
         return {
             'dihedrals_t': flow_output['dihedral_xt'],
@@ -202,25 +210,27 @@ class ChiFlowMatcher(nn.Module):
 
     def forward_marginal(self, rigids_0, t, flow_mask=None, rigids_1=None):
         """
-        Forward marginal for compatibility with existing OT code.
-        For ChiFlow, we work with dihedral angles instead of rigids.
-        This is a compatibility layer.
+        Forward marginal for ChiFlow with dihedral angles.
+        This method handles both rigid-based (for compatibility) and dihedral-based processing.
         """
-        # For ChiFlow, we don't use rigids directly
-        # This method is for compatibility with existing OT code
-        # In practice, ChiFlow's OT would work differently
-        raise NotImplementedError("ChiFlow OT implementation requires dihedral angle data, not rigids")
+        # Check if we have dihedral data in the input
+        if hasattr(rigids_0, 'dihedrals') or (isinstance(rigids_0, dict) and 'dihedrals' in rigids_0):
+            # Direct dihedral processing
+            if isinstance(rigids_0, dict):
+                dihedrals_0 = rigids_0['dihedrals']
+            else:
+                dihedrals_0 = rigids_0.dihedrals
 
-    def forward_marginal(self, rigids_0, t, flow_mask=None, rigids_1=None):
-        """
-        Forward marginal for compatibility with existing OT code.
-        For ChiFlow, we work with dihedral angles instead of rigids.
-        This is a compatibility layer.
-        """
-        # For ChiFlow, we don't use rigids directly
-        # This method is for compatibility with existing OT code
-        # In practice, ChiFlow's OT would work differently
-        raise NotImplementedError("ChiFlow OT implementation requires dihedral angle data, not rigids")
+            return self.dihedral_forward_marginal(dihedrals_0, t, flow_mask, rigids_1)
+        else:
+            # For compatibility with existing OT code that uses rigids
+            # We'll need to convert rigids to dihedrals or implement a different approach
+            # For now, raise a more informative error
+            raise NotImplementedError(
+                "ChiFlow forward_marginal with rigids requires dihedral angle data. "
+                "Please ensure dihedral angles are available in the input data, "
+                "or implement rigid-to-dihedral conversion."
+            )
 
     def encode_context(self, batch):
         """
@@ -246,6 +256,9 @@ class ChiFlowMatcher(nn.Module):
         aatype = batch['aatype']  # (B, L)
         atom_positions = batch['atom_positions']  # (B, L, 37, 3)
         atom_mask = batch['atom_mask']  # (B, L, 37)
+
+        # Ensure aatype is on the same device as the embedding weights
+        aatype = aatype.to(self.aa_embedding.weight.device)
 
         # Simple amino acid embedding
         aa_embed = self.aa_embedding(aatype)  # (B, L, feat_dim)
@@ -284,6 +297,60 @@ class ChiFlowMatcher(nn.Module):
 
         return dist_feat
 
+    def _compute_mirror_constraint_loss(self, dihedral_flow, dihedrals, mask=None):
+        """
+        Compute mirror operator antisymmetric constraint loss for chirality.
+
+        The mirror operator M should satisfy:
+        M * φ = -φ (antisymmetric for phi)
+        M * ψ = -ψ (antisymmetric for psi)
+        M * ω = ω  (symmetric for omega)
+
+        This enforces that the flow respects chirality.
+        """
+        # Apply mirror operator: flip the sign of phi and psi, keep omega unchanged
+        mirror_dihedrals = torch.zeros_like(dihedrals)
+        mirror_dihedrals[:, :, 0] = -dihedrals[:, :, 0]  # M * φ = -φ
+        mirror_dihedrals[:, :, 1] = -dihedrals[:, :, 1]  # M * ψ = -ψ
+        mirror_dihedrals[:, :, 2] = dihedrals[:, :, 2]   # M * ω = ω
+
+        # Compute flow for mirrored dihedrals
+        mirror_batch = {
+            'dihedrals': mirror_dihedrals,
+            'aatype': torch.zeros_like(dihedrals[:, :, 0], dtype=torch.long),
+            'atom_positions': torch.zeros(dihedrals.shape[0], dihedrals.shape[1], 37, 3, device=dihedrals.device),
+            'atom_mask': torch.ones(dihedrals.shape[0], dihedrals.shape[1], 37, device=dihedrals.device),
+            'res_mask': torch.ones(dihedrals.shape[0], dihedrals.shape[1], device=dihedrals.device),
+        }
+
+        # Get context for mirror batch
+        mirror_context = self.encode_context(mirror_batch)
+
+        # Add time embedding if available
+        if hasattr(self, 'time_embed') and 't' in locals():
+            t_tensor = torch.zeros(dihedrals.shape[0], device=dihedrals.device)
+            mirror_context = mirror_context + self.time_embed(t_tensor.unsqueeze(-1))
+
+        # Get mirror flow
+        mirror_flow, _ = self.torus_flow(mirror_dihedrals, mirror_context, None, mask)
+
+        # Mirror constraint: M * v(θ) should equal -v(M * θ) for phi and psi
+        # For omega: M * v(θ) should equal v(M * θ)
+        expected_mirror_flow = torch.zeros_like(dihedral_flow)
+        expected_mirror_flow[:, :, 0] = -dihedral_flow[:, :, 0]  # -v_φ
+        expected_mirror_flow[:, :, 1] = -dihedral_flow[:, :, 1]  # -v_ψ
+        expected_mirror_flow[:, :, 2] = dihedral_flow[:, :, 2]   # v_ω
+
+        # Compute constraint loss
+        if mask is not None:
+            mask = mask.unsqueeze(-1).expand_as(dihedral_flow)
+
+        mirror_constraint_loss = (mirror_flow - expected_mirror_flow) ** 2
+        if mask is not None:
+            mirror_constraint_loss = mirror_constraint_loss * mask
+
+        return mirror_constraint_loss.mean()
+
     def forward(self, batch, t=None):
         """
         Forward pass of ChiFlow matcher.
@@ -303,6 +370,12 @@ class ChiFlowMatcher(nn.Module):
 
         # Get toroidal flow
         dihedral_flow, dihedral_xt = self.torus_flow(dihedrals, context, t, mask)
+
+        # Apply mirror operator antisymmetric constraints for chirality
+        if self.use_mirror_constraint and self.training:
+            mirror_loss = self._compute_mirror_constraint_loss(dihedral_flow, dihedrals, mask)
+            # Store mirror loss for external access
+            self.mirror_loss = mirror_loss
 
         return {
             'dihedral_flow': dihedral_flow,

@@ -88,7 +88,14 @@ def pad(x: np.ndarray, max_len: int, pad_idx=0, use_torch=False, reverse=False):
     else:
         pad_widths[pad_idx] = (0, pad_amt)
     if use_torch:
-        return torch.pad(x, pad_widths)
+        import torch.nn.functional as F
+        # Convert numpy pad format to torch pad format
+        # torch pad format is [pad_left_dimN, pad_right_dimN, ..., pad_left_dim1, pad_right_dim1]
+        torch_pad = []
+        for i in range(len(pad_widths) - 1, -1, -1):  # Reverse order for torch
+            torch_pad.extend(pad_widths[i])
+        return F.pad(x, torch_pad)
+    return np.pad(x, pad_widths)
     return np.pad(x, pad_widths)
 
 
@@ -223,7 +230,7 @@ def length_batching(
 
     max_len = length_sorted[0][0]
     max_batch_examples = max(int(max_squared_res // max_len**2), 1)
-    pad_example = lambda x: pad_feats(x, max_len)
+    pad_example = lambda x: pad_feats(x, max_len, use_torch=True)
 
     keep = length_sorted[:max_batch_examples]
     padded_batch = [pad_example(x) for (_, x) in keep]
@@ -260,7 +267,12 @@ def create_data_loader(
         collate_fn = None
 
     persistent_workers = True if num_workers > 0 else False
-    prefetch_factor = 2 if num_workers == 0 else prefetch_factor
+    # Only set prefetch_factor when using multiprocessing
+    if num_workers > 0:
+        prefetch_factor = 2 if prefetch_factor is None else prefetch_factor
+    else:
+        prefetch_factor = None
+
     return data.DataLoader(
         torch_dataset,
         sampler=sampler,
@@ -294,8 +306,10 @@ def move_to_np(x):
         return x.cpu().detach().numpy()
     if isinstance(x, np.ndarray):
         return x
+    if isinstance(x, (int, float)):
+        return np.array(x)
     else:
-        raise ValueError(f"Expected torch.Tensor or np.ndarray, got {type(x)}.")
+        raise ValueError(f"Expected torch.Tensor, np.ndarray, int, or float, got {type(x)}.")
 
 
 def aatype_to_seq(aatype):

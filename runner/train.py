@@ -1,5 +1,9 @@
 """Pytorch script for training FoldFlow."""
 import os
+import torch.multiprocessing as mp
+
+# Set the multiprocessing start method to 'spawn' to resolve CUDA initialization issues in forked subprocesses.
+mp.set_start_method('spawn', force=True)
 
 # This line magically changes some tensors to double precision
 # so we need to reset the default dtype later.
@@ -354,7 +358,15 @@ class Experiment:
                     device = "cuda:0"
                     self._log.warning("Error on available gpus, trying with device 0")
                 self._model = self.model.to(device)
+                # Ensure all model parameters are on the correct device
+                self._model = self._model.to(device)
+                # Also move flow matcher to the correct device
+                if hasattr(self, '_flow_matcher') and self._flow_matcher is not None:
+                    self._flow_matcher = self._flow_matcher.to(device)
                 self._log.info(f"Using device: {device}")
+                self._log.info(f"Model device: {next(self._model.parameters()).device}")
+                if hasattr(self, '_flow_matcher') and self._flow_matcher is not None:
+                    self._log.info(f"Flow matcher device: {next(self._flow_matcher.parameters()).device}")
             # muti gpu mode
             elif self._exp_conf.num_gpus > 1:
                 # DDP mode
@@ -363,6 +375,9 @@ class Experiment:
                         self._model, self._optimizer
                     )
                     device = self.fabric.device
+                    # Move flow matcher to device in DDP mode
+                    if hasattr(self, '_flow_matcher') and self._flow_matcher is not None:
+                        self._flow_matcher = self.fabric.setup_module(self._flow_matcher)
                     self._log.info(f"Using device: {device}")
                 # DP mode
                 else:
@@ -385,6 +400,9 @@ class Experiment:
             device = "cpu"
             self._log.info(f"Using device: {device}")
             self._model = self.model.to(device)
+            # Move flow matcher to CPU
+            if hasattr(self, '_flow_matcher') and self._flow_matcher is not None:
+                self._flow_matcher = self._flow_matcher.to(device)
 
         self._model.train()
         (
@@ -444,7 +462,16 @@ class Experiment:
                 continue
 
             if not self._use_ddp:
-                train_feats = tree.map_structure(lambda x: x.to(device), train_feats)
+                def move_to_device(x):
+                    if torch.is_tensor(x):
+                        return x.to(device)
+                    elif isinstance(x, dict):
+                        return {k: move_to_device(v) for k, v in x.items()}
+                    elif isinstance(x, (list, tuple)):
+                        return type(x)(move_to_device(item) for item in x)
+                    else:
+                        return x
+                train_feats = tree.map_structure(move_to_device, train_feats)
 
             loss, aux_data = self.update_fn(train_feats)
 
@@ -525,50 +552,65 @@ class Experiment:
                 step_time = time.time() - step_time
                 example_per_sec = self._exp_conf.batch_size / step_time
                 step_time = time.time()
-                wandb_logs = {
-                    "loss": loss,
-                    "rotation_loss": aux_data["rot_loss"],
-                    "translation_loss": aux_data["trans_loss"],
-                    "bb_atom_loss": aux_data["bb_atom_loss"],
-                    "dist_mat_loss": aux_data["batch_dist_mat_loss"],
-                    "batch_size": aux_data["examples_per_step"],
-                    "res_length": aux_data["res_length"],
-                    "examples_per_sec": example_per_sec,
-                    "num_epochs": self.trained_epochs,
-                }
 
-                # Stratified losses
-                wandb_logs.update(
-                    eu.t_stratified_loss(
-                        du.move_to_np(train_feats["t"]),
-                        du.move_to_np(aux_data["batch_rot_loss"]),
-                        loss_name="rot_loss",
-                    )
-                )
+                if self._model_conf.model_name == "chiflow":
+                    # ChiFlow specific logging
+                    wandb_logs = {
+                        "loss": loss,
+                        "dihedral_flow_loss": aux_data["dihedral_flow_loss"],
+                        "backbone_loss": aux_data["backbone_loss"],
+                        "mirror_constraint_loss": aux_data["mirror_constraint_loss"],
+                        "batch_size": aux_data["examples_per_step"],
+                        "res_length": aux_data["res_length"],
+                        "examples_per_sec": example_per_sec,
+                        "num_epochs": self.trained_epochs,
+                    }
+                else:
+                    # SE3 flow matching logging
+                    wandb_logs = {
+                        "loss": loss,
+                        "rotation_loss": aux_data["rot_loss"],
+                        "translation_loss": aux_data["trans_loss"],
+                        "bb_atom_loss": aux_data["bb_atom_loss"],
+                        "dist_mat_loss": aux_data["batch_dist_mat_loss"],
+                        "batch_size": aux_data["examples_per_step"],
+                        "res_length": aux_data["res_length"],
+                        "examples_per_sec": example_per_sec,
+                        "num_epochs": self.trained_epochs,
+                    }
 
-                wandb_logs.update(
-                    eu.t_stratified_loss(
-                        du.move_to_np(train_feats["t"]),
-                        du.move_to_np(aux_data["batch_trans_loss"]),
-                        loss_name="trans_loss",
+                    # Stratified losses for SE3
+                    wandb_logs.update(
+                        eu.t_stratified_loss(
+                            du.move_to_np(train_feats["t"]),
+                            du.move_to_np(aux_data["batch_rot_loss"]),
+                            loss_name="rot_loss",
+                        )
                     )
-                )
 
-                wandb_logs.update(
-                    eu.t_stratified_loss(
-                        du.move_to_np(train_feats["t"]),
-                        du.move_to_np(aux_data["batch_bb_atom_loss"]),
-                        loss_name="bb_atom_loss",
+                    wandb_logs.update(
+                        eu.t_stratified_loss(
+                            du.move_to_np(train_feats["t"]),
+                            du.move_to_np(aux_data["batch_trans_loss"]),
+                            loss_name="trans_loss",
+                        )
                     )
-                )
 
-                wandb_logs.update(
-                    eu.t_stratified_loss(
-                        du.move_to_np(train_feats["t"]),
-                        du.move_to_np(aux_data["batch_dist_mat_loss"]),
-                        loss_name="dist_mat_loss",
+                    wandb_logs.update(
+                        eu.t_stratified_loss(
+                            du.move_to_np(train_feats["t"]),
+                            du.move_to_np(aux_data["batch_bb_atom_loss"]),
+                            loss_name="bb_atom_loss",
+                        )
                     )
-                )
+
+                    wandb_logs.update(
+                        eu.t_stratified_loss(
+                            du.move_to_np(train_feats["t"]),
+                            du.move_to_np(aux_data["batch_dist_mat_loss"]),
+                            loss_name="dist_mat_loss",
+                        )
+                    )
 
                 if ckpt_metrics is not None:
                     wandb_logs["eval_time"] = eval_time
@@ -614,6 +656,25 @@ class Experiment:
             gt_prot = du.move_to_np(valid_feats["atom37_pos"])
             batch_size = res_mask.shape[0]
             valid_feats = tree.map_structure(lambda x: x.to(device), valid_feats)
+
+            # For ChiFlow, generate missing features that were removed from data loader
+            if self._model_conf.model_name == "chiflow":
+                # Generate dihedrals from torsion angles
+                print(f"DEBUG: torsion_angles_sin_cos shape: {valid_feats['torsion_angles_sin_cos'].shape}")
+                torsion_sin_cos = valid_feats['torsion_angles_sin_cos'][:, :, :3, :]  # (B, L, 3, 2) - take first 3 angles
+                print(f"DEBUG: torsion_sin_cos shape after slicing: {torsion_sin_cos.shape}")
+                dihedrals = torch.atan2(torsion_sin_cos[..., 0], torsion_sin_cos[..., 1])  # (B, L, 3)
+                print(f"DEBUG: dihedrals shape: {dihedrals.shape}")
+                valid_feats["dihedrals"] = dihedrals
+
+                # Generate noisy dihedrals for inference (this replaces the missing rigids_t)
+                # Use the flow matcher to create noisy version at t=1.0
+                print(f"DEBUG: About to call dihedral_forward_marginal with dihedrals shape: {dihedrals.shape}")
+                noisy_result = self._flow_matcher.dihedral_forward_marginal(
+                    dihedrals, 1.0, flow_mask=None
+                )
+                print(f"DEBUG: noisy_result dihedrals_t shape: {noisy_result['dihedrals_t'].shape}")
+                valid_feats["dihedrals_t"] = noisy_result["dihedrals_t"]
 
             # Run inference
             infer_out = self.inference_fn(
@@ -677,6 +738,102 @@ class Experiment:
         ckpt_eval_metrics.to_csv(eval_metrics_csv_path, index=False)
         return ckpt_eval_metrics
 
+    def _prepare_chiflow_batch(self, batch):
+        """Prepare batch data for ChiFlow model.
+
+        Convert torsion_angles_sin_cos to dihedrals format expected by ChiFlow.
+        """
+        if "torsion_angles_sin_cos" in batch:
+            # Extract phi, psi, omega from torsion_angles_sin_cos
+            # Shape: (batch, seq, 7, 2) -> take first 3 angles (phi, psi, omega)
+            phi_psi_omega_sin_cos = batch["torsion_angles_sin_cos"][:, :, :3, :]  # (B, L, 3, 2)
+
+            # Convert sin/cos to angles
+            dihedrals = torch.atan2(
+                phi_psi_omega_sin_cos[:, :, :, 0],  # sin
+                phi_psi_omega_sin_cos[:, :, :, 1]   # cos
+            )  # (B, L, 3)
+
+            # Add dihedrals to batch
+            batch["dihedrals"] = dihedrals
+
+        return batch
+
+    def _chiflow_loss_fn(self, batch):
+        """ChiFlow-specific loss function for dihedral angle flow matching.
+
+        Args:
+            batch: Batch with dihedrals and other features.
+
+        Returns:
+            loss: ChiFlow training loss.
+            aux_data: Auxiliary data for logging.
+        """
+        # Get ground truth dihedrals
+        gt_dihedrals = batch["dihedrals"]  # (B, L, 3) - phi, psi, omega
+        res_mask = batch["res_mask"]  # (B, L)
+        flow_mask = 1 - batch.get("fixed_mask", torch.zeros_like(res_mask))  # (B, L)
+        loss_mask = res_mask * flow_mask  # (B, L)
+
+        # Forward pass through ChiFlow model
+        model_out = self.model(batch)
+
+        # Get predicted dihedral flow
+        pred_dihedral_flow = model_out["dihedral_flow"]  # (B, L, 3)
+        pred_dihedral_xt = model_out.get("dihedral_xt", gt_dihedrals)  # (B, L, 3)
+
+        # Get time step
+        t = batch.get("t", torch.zeros(gt_dihedrals.shape[0], device=gt_dihedrals.device))
+        if t.dim() == 0:  # scalar
+            t = t.expand(gt_dihedrals.shape[0])
+
+        # Compute ground truth flow using ChiFlow matcher
+        gt_flow_result = self._flow_matcher.dihedral_forward_marginal(
+            gt_dihedrals, t[0].item(), flow_mask
+        )
+        gt_dihedral_flow = gt_flow_result["dihedral_vectorfield"]
+
+        # Dihedral angle flow matching loss
+        dihedral_flow_mse = (gt_dihedral_flow - pred_dihedral_flow) ** 2 * loss_mask.unsqueeze(-1)
+        dihedral_flow_loss = torch.sum(dihedral_flow_mse) / (loss_mask.sum() + 1e-10)
+
+        # Optional: Add reconstruction loss for backbone coordinates
+        backbone_loss = 0.0
+        if "backbone_coords" in model_out:
+            # Reconstruct backbone from ground truth dihedrals
+            from foldflow.models.chiflow import ChiFlowModel
+            if hasattr(self._model, 'reconstruct_backbone'):
+                gt_backbone = self._model.reconstruct_backbone(gt_dihedrals, batch)
+                pred_backbone = model_out["backbone_coords"]
+
+                # Compute backbone reconstruction loss
+                backbone_mse = (gt_backbone - pred_backbone) ** 2 * loss_mask.unsqueeze(-1).unsqueeze(-1)
+                backbone_loss = torch.sum(backbone_mse) / (loss_mask.sum() + 1e-10)
+                backbone_loss *= 0.1  # Weight factor
+
+        # Total loss
+        total_loss = dihedral_flow_loss + backbone_loss
+
+        # Add mirror constraint loss if available
+        mirror_constraint_loss = 0.0
+        if hasattr(self._flow_matcher, 'mirror_loss'):
+            mirror_constraint_loss = self._flow_matcher.mirror_loss * self._flow_matcher.mirror_constraint_weight
+            total_loss += mirror_constraint_loss
+
+        # Auxiliary data for logging
+        batch_loss_mask = torch.any(res_mask, dim=-1)
+        aux_data = {
+            "batch_train_loss": total_loss,
+            "dihedral_flow_loss": dihedral_flow_loss,
+            "backbone_loss": backbone_loss,
+            "mirror_constraint_loss": mirror_constraint_loss,
+            "total_loss": total_loss,
+            "examples_per_step": torch.tensor(gt_dihedrals.shape[0]),
+            "res_length": torch.mean(torch.sum(res_mask, dim=-1)),
+        }
+
+        return total_loss, aux_data
+
     def _self_conditioning(self, batch):
         model_sc = self.model(batch)
         batch["sc_ca_t"] = model_sc["rigids"][..., 4:]
@@ -693,6 +850,11 @@ class Experiment:
             loss: Final training loss scalar.
             aux_data: Additional logging data.
         """
+        # Handle ChiFlow data format conversion
+        if self._model_conf.model_name == "chiflow":
+            batch = self._prepare_chiflow_batch(batch)
+            return self._chiflow_loss_fn(batch)
+
         if (
             self._model_conf.embed.embed_self_conditioning
             and self.trained_steps % 2 == 1
@@ -917,6 +1079,12 @@ class Experiment:
             data_init: Initial data values for sampling.
         """
 
+        # Handle ChiFlow separately
+        if self._model_conf.model_name == "chiflow":
+            return self._chiflow_inference_fn(
+                data_init, num_t, min_t, noise_scale
+            )
+
         # Run reverse process.
         sample_feats = copy.deepcopy(data_init)
         device = sample_feats["rigids_t"].device
@@ -1002,6 +1170,90 @@ class Experiment:
             ret["psi_pred"] = psi_pred[None]
             ret["rigid_0_traj"] = all_bb_0_pred
         return ret
+
+    def _chiflow_inference_fn(self, data_init, num_t=None, min_t=None, noise_scale=1.0):
+        """ChiFlow-specific inference function for dihedral-based flow matching."""
+        from foldflow.models.flows.common.nerf import nerf_build_batch
+
+        # Create a shallow copy and detach tensors to avoid deepcopy issues
+        sample_feats = {}
+        for k, v in data_init.items():
+            if isinstance(v, torch.Tensor):
+                sample_feats[k] = v.detach().clone()
+            else:
+                sample_feats[k] = v
+
+        print(f"DEBUG: Original data shapes:")
+        for k, v in sample_feats.items():
+            if isinstance(v, torch.Tensor):
+                print(f"  {k}: {v.shape}")
+            else:
+                print(f"  {k}: {type(v)}")
+
+        device = sample_feats["dihedrals_t"].device
+
+        if num_t is None:
+            num_t = self._data_conf.num_t
+        if min_t is None:
+            min_t = self._data_conf.min_t
+
+        reverse_steps = np.linspace(min_t, 1.0, num_t)[::-1]
+        dt = reverse_steps[0] - reverse_steps[1] if num_t > 1 else 1.0
+
+        all_dihedrals = [du.move_to_np(copy.deepcopy(sample_feats["dihedrals_t"]))]
+        all_bb_prots = []
+
+        with torch.no_grad():
+            for t in reverse_steps:
+                # Set time features
+                t_tensor = torch.tensor([t], device=device).expand(sample_feats["dihedrals_t"].shape[0])
+                sample_feats["t"] = t_tensor
+
+                # Model forward pass
+                model_out = self.model(sample_feats)
+                dihedral_vectorfield = model_out["dihedral_flow"]
+
+                # Euler integration step (reverse direction)
+                sample_feats["dihedrals_t"] = sample_feats["dihedrals_t"] + dihedral_vectorfield * dt
+
+                # Project to torus [-π, π]
+                sample_feats["dihedrals_t"] = torch.remainder(
+                    sample_feats["dihedrals_t"] + torch.pi, 2 * torch.pi
+                ) - torch.pi
+
+                all_dihedrals.append(du.move_to_np(sample_feats["dihedrals_t"]))
+
+                # Convert to backbone coordinates
+                phi = sample_feats["dihedrals_t"][:, :, 0]
+                psi = sample_feats["dihedrals_t"][:, :, 1]
+                omega = sample_feats["dihedrals_t"][:, :, 2]
+                print(f"DEBUG: phi shape: {phi.shape}, psi shape: {psi.shape}, omega shape: {omega.shape}")
+
+                # Build backbone coordinates (returns shape: batch, length, 3, 3)
+                backbone_coords = nerf_build_batch(phi, psi, omega)
+                print(f"DEBUG: backbone_coords shape after nerf_build_batch: {backbone_coords.shape}")
+                # No need to slice - use all coordinates
+                print(f"DEBUG: backbone_coords shape (no slicing): {backbone_coords.shape}")
+
+                # Convert to atom37 format (batch, length, 37, 3)
+                atom37_coords = torch.zeros(phi.shape[0], phi.shape[1], 37, 3, device=device)
+                print(f"DEBUG: atom37_coords shape: {atom37_coords.shape}")
+                # Map backbone atoms: N=0, CA=1, C=2 in atom37
+                atom37_coords[:, :, 0, :] = backbone_coords[:, :, 0, :]  # N
+                atom37_coords[:, :, 1, :] = backbone_coords[:, :, 1, :]  # CA
+                atom37_coords[:, :, 2, :] = backbone_coords[:, :, 2, :]  # C
+
+                all_bb_prots.append(du.move_to_np(atom37_coords))
+
+        # Flip trajectory so that it starts from t=0
+        flip = lambda x: np.flip(np.stack(x), (0,))
+        all_bb_prots = flip(all_bb_prots)
+        all_dihedrals = flip(all_dihedrals)
+
+        return {
+            "prot_traj": all_bb_prots,
+            "dihedral_traj": all_dihedrals,
+        }
 
 
 @hydra.main(version_base=None, config_path="config/", config_name="base")
