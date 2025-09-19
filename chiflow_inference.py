@@ -52,6 +52,23 @@ class ChiFlowInference:
                     'num_hidden_layers': 4,
                     'num_mixtures': 3
                 })()
+                # Add missing encoder configurations
+                self.residue_encoder = type('ResidueEncoder', (), {
+                    'num_aa_types': 21,
+                    'feat_dim': 128,
+                    'max_num_atoms': 37
+                })()
+                self.pair_encoder = type('PairEncoder', (), {
+                    'feat_dim': 64,
+                    'max_num_residues': 512
+                })()
+                # Add other missing attributes
+                self.mirror_constraint_weight = 0.1
+                self.use_mirror_constraint = True
+                self.ot_plan = False
+                self.ot_fn = 'exact'
+                self.reg = 0.05
+                self.stochastic_paths = False
 
         cfg = ModelConfig()
 
@@ -62,7 +79,7 @@ class ChiFlowInference:
 
         # Load checkpoint if provided
         if self.config.weights_path and os.path.exists(self.config.weights_path):
-            checkpoint = torch.load(self.config.weights_path, map_location=self.device)
+            checkpoint = torch.load(self.config.weights_path, map_location=self.device, weights_only=False)
             if 'model' in checkpoint:
                 self.model.load_state_dict(checkpoint['model'], strict=False)
                 print("✓ Model weights loaded successfully")
