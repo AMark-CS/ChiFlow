@@ -43,8 +43,8 @@ class ChiFlowInference:
         class ModelConfig:
             def __init__(self):
                 self.n_context_dims = 256
-                self.residue_feat_dim = 128
-                self.pair_feat_dim = 64
+                self.residue_feat_dim = 256  # Match training config
+                self.pair_feat_dim = 128     # Match training config
                 self.num_aa_types = 21
                 self.time_embed_dim = 64
                 self.flow = type('FlowConfig', (), {
@@ -55,11 +55,11 @@ class ChiFlowInference:
                 # Add missing encoder configurations
                 self.residue_encoder = type('ResidueEncoder', (), {
                     'num_aa_types': 21,
-                    'feat_dim': 128,
+                    'feat_dim': 256,  # Match residue_feat_dim
                     'max_num_atoms': 37
                 })()
                 self.pair_encoder = type('PairEncoder', (), {
-                    'feat_dim': 64,
+                    'feat_dim': 128,  # Match pair_feat_dim
                     'max_num_residues': 512
                 })()
                 # Add other missing attributes
@@ -148,59 +148,75 @@ class ChiFlowInference:
                  x, y, z, 1.0, 0.0, atom_name[0], ""))
 
     def run_inference(self):
-        """Run ChiFlow inference."""
+        """Run ChiFlow inference for multiple samples."""
         print("🚀 Starting ChiFlow inference...")
         print(f"Sequence length: {self.config.length}")
         print(f"Sampling steps: {self.config.num_steps}")
+        print(f"Number of samples: {self.config.num_samples}")
 
-        # Load model
+        # Load model once
         self.load_model()
 
-        # Create input batch
-        batch = self.create_batch(self.config.length)
+        # Create timestamped base output directory
+        base_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_run_dir = os.path.join(self.config.output_dir, f"{self.config.name}_batch_{base_timestamp}")
+        os.makedirs(base_run_dir, exist_ok=True)
+        print(f"📁 Created base output directory: {base_run_dir}")
 
-        # Run sampling
-        print("🔄 Running torus flow sampling...")
-        with torch.no_grad():
-            sample_output = self.model.sample(batch, num_steps=self.config.num_steps)
+        # Generate multiple samples
+        for sample_idx in range(self.config.num_samples):
+            print(f"\n🔄 Generating sample {sample_idx + 1}/{self.config.num_samples}...")
 
-        backbone_coords = sample_output['backbone_coords']
-        dihedrals = sample_output['dihedrals']
+            # Set different seed for each sample to ensure diversity
+            sample_seed = self.config.seed + sample_idx
+            torch.manual_seed(sample_seed)
+            np.random.seed(sample_seed)
 
-        print("✓ Inference completed!")
-        print(f"Generated backbone shape: {backbone_coords.shape}")
-        print(f"Generated dihedrals shape: {dihedrals.shape}")
+            # Create input batch
+            batch = self.create_batch(self.config.length)
 
-        # Create timestamped output directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(self.config.output_dir, f"{self.config.name}_{timestamp}")
-        os.makedirs(run_dir, exist_ok=True)
-        print(f"📁 Created output directory: {run_dir}")
+            # Run sampling
+            with torch.no_grad():
+                sample_output = self.model.sample(batch, num_steps=self.config.num_steps)
 
-        # Save PDB
-        pdb_path = os.path.join(run_dir, f"{self.config.name}.pdb")
-        self.save_pdb(backbone_coords, pdb_path)
+            backbone_coords = sample_output['backbone_coords']
+            dihedrals = sample_output['dihedrals']
 
-        # Save dihedrals
-        dihedrals_path = os.path.join(run_dir, f"{self.config.name}_dihedrals.npy")
-        np.save(dihedrals_path, dihedrals[0].cpu().numpy())
-        print(f"✓ Dihedrals saved to: {dihedrals_path}")
+            print(f"✓ Sample {sample_idx + 1} completed!")
+            print(f"Generated backbone shape: {backbone_coords.shape}")
+            print(f"Generated dihedrals shape: {dihedrals.shape}")
 
-        # Save configuration
-        config_path = os.path.join(run_dir, f"{self.config.name}_config.txt")
+            # Create sample-specific output directory
+            sample_name = f"{self.config.name}_{sample_idx + 1:03d}"
+            sample_dir = os.path.join(base_run_dir, sample_name)
+            os.makedirs(sample_dir, exist_ok=True)
+
+            # Save PDB
+            pdb_path = os.path.join(sample_dir, f"{sample_name}.pdb")
+            self.save_pdb(backbone_coords, pdb_path)
+
+            # Save dihedrals
+            dihedrals_path = os.path.join(sample_dir, f"{sample_name}_dihedrals.npy")
+            np.save(dihedrals_path, dihedrals[0].cpu().numpy())
+            print(f"✓ Sample {sample_idx + 1} saved to: {sample_dir}")
+
+        # Save batch configuration
+        config_path = os.path.join(base_run_dir, f"{self.config.name}_batch_config.txt")
         with open(config_path, 'w') as f:
-            f.write(f"ChiFlow Inference Configuration\n")
-            f.write(f"===========================\n")
+            f.write(f"ChiFlow Batch Inference Configuration\n")
+            f.write(f"===================================\n")
             f.write(f"Sequence length: {self.config.length}\n")
             f.write(f"Sampling steps: {self.config.num_steps}\n")
-            f.write(f"Random seed: {self.config.seed}\n")
+            f.write(f"Number of samples: {self.config.num_samples}\n")
+            f.write(f"Base random seed: {self.config.seed}\n")
             f.write(f"Device: {self.device}\n")
-            f.write(f"Output directory: {run_dir}\n")
-            f.write(f"Timestamp: {timestamp}\n")
-        print(f"✓ Configuration saved to: {config_path}")
+            f.write(f"Base output directory: {base_run_dir}\n")
+            f.write(f"Timestamp: {base_timestamp}\n")
+        print(f"✓ Batch configuration saved to: {config_path}")
 
-        print("🎉 ChiFlow inference completed successfully!")
-        print(f"📁 All results saved in: {run_dir}")
+        print("🎉 ChiFlow batch inference completed successfully!")
+        print(f"📁 All results saved in: {base_run_dir}")
+        print(f"📊 Generated {self.config.num_samples} protein samples")
 
 
 def main():
@@ -210,14 +226,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate a 100-residue protein backbone
+  # Generate a single 100-residue protein backbone
   python chiflow_inference.py --length 100 --output_dir ./results
 
-  # Generate with custom sampling steps
-  python chiflow_inference.py --length 150 --num_steps 100 --name my_protein
+  # Generate 50 protein samples with custom sampling steps
+  python chiflow_inference.py --length 150 --num_steps 100 --num_samples 50 --name batch_protein
 
-  # Use specific GPU
-  python chiflow_inference.py --length 200 --gpu_id 1 --seed 42
+  # Use specific GPU and weights
+  python chiflow_inference.py --length 200 --gpu_id 1 --seed 42 --weights_path ./ckpt/model.pth
         """
     )
 
@@ -270,6 +286,13 @@ Examples:
         help="Path to model checkpoint (optional)"
     )
 
+    parser.add_argument(
+        "--num_samples", "-ns",
+        type=int,
+        default=1,
+        help="Number of protein samples to generate (default: 1)"
+    )
+
     args = parser.parse_args()
 
     # Validate arguments
@@ -277,6 +300,8 @@ Examples:
         parser.error("Sequence length must be positive")
     if args.num_steps <= 0:
         parser.error("Number of steps must be positive")
+    if args.num_samples <= 0:
+        parser.error("Number of samples must be positive")
 
     # Create config object
     config = args

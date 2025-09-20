@@ -7,7 +7,7 @@ data:
   csv_path: ./data/metadata_one.csv
   cluster_path: ./data/clusters-by-entity-30.txt # or any cluster file
   filtering:
-    max_len: 512
+    max_len: 256
   min_t: 0.01
   cache_full_dataset: False  # Cache both to disk (LMDB) and in memory.
   cache_dataset_in_memory: False # If True load from mem. If False, load from disk (LMDB).

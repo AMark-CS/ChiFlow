@@ -5,6 +5,7 @@ Based on the ChiFlow paper using torsional asymmetry flow matching.
 
 import torch
 import torch.nn as nn
+import math
 from typing import Dict, Any, Optional
 from .flows.common.layers import LeakyMLP
 from .flows.encoders.residue import PerResidueEncoder
@@ -52,69 +53,50 @@ class HighDimTorusFlow(nn.Module):
         return torch.sqrt(self.g**2 * t * (1 - t) + self.min_sigma**2)
 
     def forward(self, dihedrals, context, t=None, mask=None):
-        """
-        Forward pass for high-dim toroidal flow.
-        dihedrals: (B, L, 3) - φ, ψ, ω angles
-        context: (B, L, C) - contextual features
-        t: (B,) or (B, L) time
-        mask: (B, L) mask for valid positions
+        """Pure vector-field prediction on torus (no internal Euler step).
+
+        Returns predicted instantaneous velocity (vector field) in angle space.
+        dihedrals: (B, L, 3)
+        context: (B, L, C)
+        t: optional time (B,) or (B,1,1) used only for potential conditioning in the future.
+        mask: (B, L)
         """
         B, L, D = dihedrals.shape
-        assert D == self.n_dims, f"Expected {self.n_dims} dims, got {D}"
-
-        # Flatten batch and sequence dimensions
-        dihedrals_flat = dihedrals.view(B*L, D)  # (B*L, 3)
-        context_flat = context.view(B*L, -1)     # (B*L, C)
-
-        # Process each dihedral angle separately
+        assert D == self.n_dims
+        context_flat = context.reshape(B * L, -1)
         flows = []
-        xts = []
-
         for d in range(self.n_dims):
-            # Get vector field for this angle
             vf_params = self.vector_field_nets[d](context_flat)  # (B*L, 3*num_mixtures)
-            vx_t = vf_params.view(B*L, 3, self.num_mixtures)     # (B*L, 3, num_mixtures)
-
-            # Sample flow for this angle using simple Euler integration
-            angle_dihedrals = dihedrals_flat[:, d]  # (B*L,)
-            if t is None:
-                t_tensor = torch.rand(B*L, device=dihedrals.device)
-            else:
-                t_tensor = t.view(B*L) if t.dim() > 1 else t.repeat(B*L)
-
-            # Simple Euler step for torus flow
-            dt = 0.01  # Small time step
-            noise = torch.randn_like(angle_dihedrals) * 0.1
-            ut = vx_t.mean(dim=-1)[:, 0]  # Take mean across mixtures, first component
-            xt = angle_dihedrals + ut * dt + noise
-
-            # Add stochastic noise if enabled
-            if self.stochastic_paths:
-                epsilon_t = self.compute_sigma_t(t_tensor.mean())
-                stochastic_noise = torch.randn_like(xt) * epsilon_t
-                xt = xt + stochastic_noise
-
-            # Project to torus [-pi, pi]
-            xt = torch.remainder(xt + torch.pi, 2 * torch.pi) - torch.pi
-
-            flows.append(ut.unsqueeze(-1))
-            xts.append(xt.unsqueeze(-1))
-
-        # Stack flows and xts
-        dihedral_flow = torch.cat(flows, dim=-1)  # (B*L, 3)
-        dihedral_xt = torch.cat(xts, dim=-1)      # (B*L, 3)
-
-        # Reshape back to (B, L, 3)
-        dihedral_flow = dihedral_flow.view(B, L, D)
-        dihedral_xt = dihedral_xt.view(B, L, D)
-
-        # Apply mask if provided
+            vf_params = vf_params.view(B * L, 3, self.num_mixtures)
+            # Use mean over mixture components first channel as velocity (simple reduction)
+            ut = vf_params.mean(dim=-1)[:, 0]  # (B*L,)
+            flows.append(ut.view(B, L, 1))
+        dihedral_flow = torch.cat(flows, dim=-1)  # (B,L,3)
         if mask is not None:
-            mask = mask.unsqueeze(-1).expand_as(dihedral_flow)
-            dihedral_flow = torch.where(mask, dihedral_flow, torch.zeros_like(dihedral_flow))
-            dihedral_xt = torch.where(mask, dihedral_xt, dihedrals)
+            dihedral_flow = dihedral_flow * mask.unsqueeze(-1)
+        # For backward compatibility we return dihedral_xt as the current dihedrals (identity)
+        return dihedral_flow, dihedrals
 
-        return dihedral_flow, dihedral_xt
+
+# --------- Angle utility functions for path-based supervision ---------- #
+def angle_wrap(x: torch.Tensor) -> torch.Tensor:
+    return (x + math.pi) % (2 * math.pi) - math.pi
+
+
+def angle_diff(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+    return angle_wrap(target - source)
+
+
+def linear_torus_path(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Analytic linear interpolation on torus per angle with wrapping.
+
+    x0,x1: (...,3) starting and ending dihedral angles in [-pi,pi]
+    t: broadcastable scalar or (...,1,1) in [0,1]
+    Returns x_t with wrap to [-pi,pi].
+    """
+    delta = angle_diff(x1, x0)
+    x_t = angle_wrap(x0 + delta * t)
+    return x_t
 
 
 class ChiFlowMatcher(nn.Module):
@@ -187,7 +169,6 @@ class ChiFlowMatcher(nn.Module):
         flow_mask: (B, L) mask for flowed positions
         dihedrals_1: (B, L, 3) noise dihedral angles (optional)
         """
-        print(f"DEBUG: dihedral_forward_marginal input dihedrals_0 shape: {dihedrals_0.shape}")
         # Create batch with dihedral angles
         batch = {
             'dihedrals': dihedrals_0,
@@ -200,8 +181,8 @@ class ChiFlowMatcher(nn.Module):
         # Add time to batch
         t_tensor = torch.tensor([t], device=dihedrals_0.device).expand(dihedrals_0.shape[0])
 
-        # Forward pass
-        flow_output = self.forward(batch, t=t_tensor)
+        # Forward pass (disable mirror loss to avoid recursion)
+        flow_output = self.forward(batch, t=t_tensor, compute_mirror_loss=False)
 
         return {
             'dihedrals_t': flow_output['dihedral_xt'],
@@ -297,7 +278,7 @@ class ChiFlowMatcher(nn.Module):
 
         return dist_feat
 
-    def _compute_mirror_constraint_loss(self, dihedral_flow, dihedrals, mask=None):
+    def _compute_mirror_constraint_loss(self, dihedral_flow, dihedrals, t, batch, mask=None):
         """
         Compute mirror operator antisymmetric constraint loss for chirality.
 
@@ -314,25 +295,12 @@ class ChiFlowMatcher(nn.Module):
         mirror_dihedrals[:, :, 1] = -dihedrals[:, :, 1]  # M * ψ = -ψ
         mirror_dihedrals[:, :, 2] = dihedrals[:, :, 2]   # M * ω = ω
 
-        # Compute flow for mirrored dihedrals
-        mirror_batch = {
-            'dihedrals': mirror_dihedrals,
-            'aatype': torch.zeros_like(dihedrals[:, :, 0], dtype=torch.long),
-            'atom_positions': torch.zeros(dihedrals.shape[0], dihedrals.shape[1], 37, 3, device=dihedrals.device),
-            'atom_mask': torch.ones(dihedrals.shape[0], dihedrals.shape[1], 37, device=dihedrals.device),
-            'res_mask': torch.ones(dihedrals.shape[0], dihedrals.shape[1], device=dihedrals.device),
-        }
+        # Reuse original batch features (aatype / atom positions) to keep context consistent
+        mirror_batch = {**batch, 'dihedrals': mirror_dihedrals}
 
-        # Get context for mirror batch
-        mirror_context = self.encode_context(mirror_batch)
-
-        # Add time embedding if available
-        if hasattr(self, 'time_embed') and 't' in locals():
-            t_tensor = torch.zeros(dihedrals.shape[0], device=dihedrals.device)
-            mirror_context = mirror_context + self.time_embed(t_tensor.unsqueeze(-1))
-
-        # Get mirror flow
-        mirror_flow, _ = self.torus_flow(mirror_dihedrals, mirror_context, None, mask)
+        # Prevent recursive mirror loss computation by disabling in inner forward
+        mirror_output = self.forward(mirror_batch, t=t, compute_mirror_loss=False)
+        mirror_flow = mirror_output['dihedral_flow']
 
         # Mirror constraint: M * v(θ) should equal -v(M * θ) for phi and psi
         # For omega: M * v(θ) should equal v(M * θ)
@@ -351,9 +319,14 @@ class ChiFlowMatcher(nn.Module):
 
         return mirror_constraint_loss.mean()
 
-    def forward(self, batch, t=None):
-        """
-        Forward pass of ChiFlow matcher.
+    def forward(self, batch, t=None, compute_mirror_loss: bool = True, x_t: Optional[torch.Tensor] = None):
+        """Forward pass of ChiFlow matcher.
+
+        Args:
+            batch: dict with 'dihedrals', 'mask', plus context feature inputs.
+            t: (optional) time tensor (currently unused but reserved).
+            compute_mirror_loss: whether to compute chirality mirror penalty.
+            x_t: optional interpolated angles replacing raw dihedrals for path-based supervision.
         """
         dihedrals = batch['dihedrals']  # (B, L, 3)
         mask = batch.get('mask', None)  # (B, L)
@@ -368,14 +341,21 @@ class ChiFlowMatcher(nn.Module):
             time_feat = self.time_embed(t)
             context = context + time_feat
 
-        # Get toroidal flow
-        dihedral_flow, dihedral_xt = self.torus_flow(dihedrals, context, t, mask)
-
+        # Decide which input angles (original or interpolated) to condition on
+        input_angles = dihedrals if x_t is None else x_t
+        dihedral_flow, _ = self.torus_flow(input_angles, context, t, mask)
+        dihedral_xt = input_angles
         # Apply mirror operator antisymmetric constraints for chirality
-        if self.use_mirror_constraint and self.training:
-            mirror_loss = self._compute_mirror_constraint_loss(dihedral_flow, dihedrals, mask)
+        if self.use_mirror_constraint and self.training and compute_mirror_loss:
+            mirror_loss = self._compute_mirror_constraint_loss(
+                dihedral_flow, dihedrals, t, batch, mask
+            )
             # Store mirror loss for external access
             self.mirror_loss = mirror_loss
+        else:
+            # Ensure attribute exists to avoid hasattr checks every step
+            if not hasattr(self, 'mirror_loss'):
+                self.mirror_loss = torch.tensor(0.0, device=dihedrals.device)
 
         return {
             'dihedral_flow': dihedral_flow,
@@ -421,6 +401,7 @@ class ChiFlowModel(nn.Module):
         self.cfg = cfg
 
     def forward(self, batch, t=None):
+        # Keep interface unchanged for external callers
         return self.flow_matcher.forward(batch, t)
 
     def sample(self, batch, num_steps=100):

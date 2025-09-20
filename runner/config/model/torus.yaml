@@ -39,7 +39,7 @@ time_embed:
   dim: ${model.time_embed_dim}
 
 # Mirror operator constraints
-mirror_constraint_weight: 0.1
+mirror_constraint_weight: 1.0
 use_mirror_constraint: true
 
 # Optimal Transport parameters

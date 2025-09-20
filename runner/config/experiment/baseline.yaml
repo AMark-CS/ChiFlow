@@ -1,5 +1,5 @@
 # Experiment metadata
-name: baseline
+name: chiflow
 run_id: null
 
 #training mode
@@ -7,22 +7,24 @@ use_ddp : False
 
 # Training arguments
 log_freq: 100
-batch_size: 4
+batch_size: 128
 eval_batch_size: ${data.samples_per_eval_length}
 num_loader_workers: 2
 torch_num_threads: 4
-num_epoch: 500
+num_epoch: 100
 learning_rate: 0.0001
 max_squared_res: 500000
 prefetch_factor: 100
 use_gpu: True
 num_gpus: 1
 sample_mode: cluster_time_batch
+mirror_warmup_steps: 2000  # newly added for chirality constraint gradual ramp
+backbone_recon_weight: 0.0  # can tune later
 
 
 # How many steps to checkpoint between.
-ckpt_freq: 5000
-eval_freq: 5000
+ckpt_freq: 400
+eval_freq: 200
 # Take early checkpoint at step 100. Helpful for catching eval bugs early.
 early_ckpt: True
 

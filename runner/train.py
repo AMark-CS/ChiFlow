@@ -418,6 +418,21 @@ class Experiment:
                 train_sampler.set_epoch(epoch)
             if valid_sampler is not None:
                 valid_sampler.set_epoch(epoch)
+                # Memory / batch diagnostics (first few steps and periodic)
+                if (
+                    torch.cuda.is_available()
+                    and self.trained_steps <= 5
+                ) or (self.trained_steps % 500 == 0 and torch.cuda.is_available()):
+                    try:
+                        alloc = torch.cuda.memory_allocated() / 1024 ** 2
+                        reserved = torch.cuda.memory_reserved() / 1024 ** 2
+                        lengths = batch.get('res_mask', torch.ones(1,1)).sum(dim=-1)
+                        eff_tokens = lengths.sum().item()
+                        self._log.info(
+                            f"[Diag] step={self.trained_steps} batch_size={len(lengths)} mean_len={lengths.float().mean():.1f} total_tokens={eff_tokens} mem_alloc={alloc:.1f}MB mem_reserved={reserved:.1f}MB"
+                        )
+                    except Exception:
+                        pass
             self.trained_epochs = epoch
             epoch_log = self.train_epoch(
                 train_loader, valid_loader, device, return_logs=return_logs
@@ -660,20 +675,15 @@ class Experiment:
             # For ChiFlow, generate missing features that were removed from data loader
             if self._model_conf.model_name == "chiflow":
                 # Generate dihedrals from torsion angles
-                print(f"DEBUG: torsion_angles_sin_cos shape: {valid_feats['torsion_angles_sin_cos'].shape}")
                 torsion_sin_cos = valid_feats['torsion_angles_sin_cos'][:, :, :3, :]  # (B, L, 3, 2) - take first 3 angles
-                print(f"DEBUG: torsion_sin_cos shape after slicing: {torsion_sin_cos.shape}")
                 dihedrals = torch.atan2(torsion_sin_cos[..., 0], torsion_sin_cos[..., 1])  # (B, L, 3)
-                print(f"DEBUG: dihedrals shape: {dihedrals.shape}")
                 valid_feats["dihedrals"] = dihedrals
 
                 # Generate noisy dihedrals for inference (this replaces the missing rigids_t)
                 # Use the flow matcher to create noisy version at t=1.0
-                print(f"DEBUG: About to call dihedral_forward_marginal with dihedrals shape: {dihedrals.shape}")
                 noisy_result = self._flow_matcher.dihedral_forward_marginal(
                     dihedrals, 1.0, flow_mask=None
                 )
-                print(f"DEBUG: noisy_result dihedrals_t shape: {noisy_result['dihedrals_t'].shape}")
                 valid_feats["dihedrals_t"] = noisy_result["dihedrals_t"]
 
             # Run inference
@@ -760,78 +770,76 @@ class Experiment:
         return batch
 
     def _chiflow_loss_fn(self, batch):
-        """ChiFlow-specific loss function for dihedral angle flow matching.
+        """ChiFlow analytic torus flow matching loss.
 
-        Args:
-            batch: Batch with dihedrals and other features.
-
-        Returns:
-            loss: ChiFlow training loss.
-            aux_data: Auxiliary data for logging.
+        Implements linear torus path x_t = wrap(x0 + t*(x1-x0)) with x1 random noise (target angles).
+        Supervises vector field v_theta(x_t,t) against ground truth constant field (x1-x0) along path.
+        Per-sample t ~ U(0,1). Optionally includes chirality mirror penalty and backbone reconstruction.
         """
-        # Get ground truth dihedrals
-        gt_dihedrals = batch["dihedrals"]  # (B, L, 3) - phi, psi, omega
-        res_mask = batch["res_mask"]  # (B, L)
-        flow_mask = 1 - batch.get("fixed_mask", torch.zeros_like(res_mask))  # (B, L)
-        loss_mask = res_mask * flow_mask  # (B, L)
+        from foldflow.models.chiflow import angle_diff, linear_torus_path
 
-        # Forward pass through ChiFlow model
-        model_out = self.model(batch)
+        gt_dihedrals = batch['dihedrals']  # (B,L,3)
+        res_mask = batch['res_mask']
+        flow_mask = 1 - batch.get('fixed_mask', torch.zeros_like(res_mask))
+        loss_mask = (res_mask * flow_mask).float()
+        device = gt_dihedrals.device
+        B, L, D = gt_dihedrals.shape
 
-        # Get predicted dihedral flow
-        pred_dihedral_flow = model_out["dihedral_flow"]  # (B, L, 3)
-        pred_dihedral_xt = model_out.get("dihedral_xt", gt_dihedrals)  # (B, L, 3)
+        # Sample per-sample time t ~ U(0,1)
+        t = torch.rand(B, device=device).view(B, 1, 1)
 
-        # Get time step
-        t = batch.get("t", torch.zeros(gt_dihedrals.shape[0], device=gt_dihedrals.device))
-        if t.dim() == 0:  # scalar
-            t = t.expand(gt_dihedrals.shape[0])
+        # Sample random target endpoint x1 uniformly on torus
+        x1 = torch.rand_like(gt_dihedrals) * 2 * torch.pi - torch.pi
 
-        # Compute ground truth flow using ChiFlow matcher
-        gt_flow_result = self._flow_matcher.dihedral_forward_marginal(
-            gt_dihedrals, t[0].item(), flow_mask
-        )
-        gt_dihedral_flow = gt_flow_result["dihedral_vectorfield"]
+        # Construct interpolation
+        x0 = gt_dihedrals.detach()  # treat as data
+        x_t = linear_torus_path(x0, x1, t)
 
-        # Dihedral angle flow matching loss
-        dihedral_flow_mse = (gt_dihedral_flow - pred_dihedral_flow) ** 2 * loss_mask.unsqueeze(-1)
-        dihedral_flow_loss = torch.sum(dihedral_flow_mse) / (loss_mask.sum() + 1e-10)
+        # Ground truth vector field along linear path is constant difference scaled by wrap
+        gt_v = angle_diff(x1, x0)  # (B,L,3)
+        # (independent of t for linear interpolation) — optionally scale by 1 for direct supervision
 
-        # Optional: Add reconstruction loss for backbone coordinates
-        backbone_loss = 0.0
-        if "backbone_coords" in model_out:
-            # Reconstruct backbone from ground truth dihedrals
-            from foldflow.models.chiflow import ChiFlowModel
-            if hasattr(self._model, 'reconstruct_backbone'):
+        # Predict vector field at x_t
+        model_out = self.model.flow_matcher.forward({**batch, 'dihedrals': x0}, x_t=x_t, compute_mirror_loss=False)
+        pred_v = model_out['dihedral_flow']  # (B,L,3)
+
+        # MSE with masking
+        mse = (pred_v - gt_v) ** 2 * loss_mask.unsqueeze(-1)
+        dihedral_flow_loss = torch.sum(mse) / (loss_mask.sum() * D + 1e-10)
+
+        # Mirror chirality warm-up (increase weight after warmup steps)
+        mirror_constraint_loss = torch.tensor(0.0, device=device)
+        mirror_warmup = getattr(self._exp_conf, 'mirror_warmup_steps', 0)
+        base_mirror_weight = getattr(self._model_conf, 'mirror_constraint_weight', 0.0)
+        if base_mirror_weight > 0.0:
+            # Compute current mirror loss using original batch (x0) if model supports it
+            mirror_out = self.model.flow_matcher.forward(batch, compute_mirror_loss=True)
+            if hasattr(self.model.flow_matcher, 'mirror_loss'):
+                progress = min(1.0, self.trained_steps / max(1, mirror_warmup)) if mirror_warmup > 0 else 1.0
+                mirror_constraint_loss = self.model.flow_matcher.mirror_loss * base_mirror_weight * progress
+        total_loss = dihedral_flow_loss + mirror_constraint_loss
+
+        backbone_loss = torch.tensor(0.0, device=device)
+        if hasattr(self._model, 'reconstruct_backbone') and getattr(self._exp_conf, 'backbone_recon_weight', 0.0) > 0:
+            with torch.no_grad():
                 gt_backbone = self._model.reconstruct_backbone(gt_dihedrals, batch)
-                pred_backbone = model_out["backbone_coords"]
+            # Optionally reconstruct from x_t (closer to training distribution) or predicted angles (x0 here)
+            pred_backbone = self._model.reconstruct_backbone(gt_dihedrals, batch)
+            bb_mse = (gt_backbone - pred_backbone) ** 2 * loss_mask.unsqueeze(-1).unsqueeze(-1)
+            backbone_loss = torch.sum(bb_mse) / (loss_mask.sum() * 3 + 1e-10)
+            backbone_loss *= getattr(self._exp_conf, 'backbone_recon_weight', 0.0)
+            total_loss += backbone_loss
 
-                # Compute backbone reconstruction loss
-                backbone_mse = (gt_backbone - pred_backbone) ** 2 * loss_mask.unsqueeze(-1).unsqueeze(-1)
-                backbone_loss = torch.sum(backbone_mse) / (loss_mask.sum() + 1e-10)
-                backbone_loss *= 0.1  # Weight factor
-
-        # Total loss
-        total_loss = dihedral_flow_loss + backbone_loss
-
-        # Add mirror constraint loss if available
-        mirror_constraint_loss = 0.0
-        if hasattr(self._flow_matcher, 'mirror_loss'):
-            mirror_constraint_loss = self._flow_matcher.mirror_loss * self._flow_matcher.mirror_constraint_weight
-            total_loss += mirror_constraint_loss
-
-        # Auxiliary data for logging
-        batch_loss_mask = torch.any(res_mask, dim=-1)
         aux_data = {
-            "batch_train_loss": total_loss,
-            "dihedral_flow_loss": dihedral_flow_loss,
-            "backbone_loss": backbone_loss,
-            "mirror_constraint_loss": mirror_constraint_loss,
-            "total_loss": total_loss,
-            "examples_per_step": torch.tensor(gt_dihedrals.shape[0]),
-            "res_length": torch.mean(torch.sum(res_mask, dim=-1)),
+            'batch_train_loss': total_loss.detach(),
+            'dihedral_flow_loss': dihedral_flow_loss.detach(),
+            'mirror_constraint_loss': mirror_constraint_loss.detach(),
+            'backbone_loss': backbone_loss.detach(),
+            'total_loss': total_loss.detach(),
+            'examples_per_step': torch.tensor(B, device=device),
+            'res_length': torch.mean(torch.sum(res_mask, dim=-1).float()),
+            't_mean': t.mean().detach(),
         }
-
         return total_loss, aux_data
 
     def _self_conditioning(self, batch):
@@ -1183,13 +1191,6 @@ class Experiment:
             else:
                 sample_feats[k] = v
 
-        print(f"DEBUG: Original data shapes:")
-        for k, v in sample_feats.items():
-            if isinstance(v, torch.Tensor):
-                print(f"  {k}: {v.shape}")
-            else:
-                print(f"  {k}: {type(v)}")
-
         device = sample_feats["dihedrals_t"].device
 
         if num_t is None:
@@ -1227,17 +1228,13 @@ class Experiment:
                 phi = sample_feats["dihedrals_t"][:, :, 0]
                 psi = sample_feats["dihedrals_t"][:, :, 1]
                 omega = sample_feats["dihedrals_t"][:, :, 2]
-                print(f"DEBUG: phi shape: {phi.shape}, psi shape: {psi.shape}, omega shape: {omega.shape}")
 
                 # Build backbone coordinates (returns shape: batch, length, 3, 3)
                 backbone_coords = nerf_build_batch(phi, psi, omega)
-                print(f"DEBUG: backbone_coords shape after nerf_build_batch: {backbone_coords.shape}")
                 # No need to slice - use all coordinates
-                print(f"DEBUG: backbone_coords shape (no slicing): {backbone_coords.shape}")
 
                 # Convert to atom37 format (batch, length, 37, 3)
                 atom37_coords = torch.zeros(phi.shape[0], phi.shape[1], 37, 3, device=device)
-                print(f"DEBUG: atom37_coords shape: {atom37_coords.shape}")
                 # Map backbone atoms: N=0, CA=1, C=2 in atom37
                 atom37_coords[:, :, 0, :] = backbone_coords[:, :, 0, :]  # N
                 atom37_coords[:, :, 1, :] = backbone_coords[:, :, 1, :]  # CA

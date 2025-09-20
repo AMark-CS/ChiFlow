@@ -19,7 +19,7 @@ inference:
   output_dir: ./results
 
   # Path to model weights.
-  weights_path: ./ckpt/baseline/step_50.pth
+  weights_path: ./ckpt/baseline/step_14000.pth
 
   flow:
     # Number of steps for torus flow sampling.
@@ -35,9 +35,9 @@ inference:
     # Number of ESMFdold samples per backbone sample.
     seq_per_sample: 8
     # Minimum sequence length to sample.
-    min_length: 100
+    min_length: 150
     # Maximum sequence length to sample.
-    max_length: 300
+    max_length: 150
     # gap between lengths to sample. i.e. this script will sample all lengths
     # in range(min_length, max_length, length_step)
     length_step: 50
