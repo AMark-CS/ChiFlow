@@ -1,8 +1,0 @@
-ChiFlow Inference Configuration
-===========================
-Sequence length: 150
-Sampling steps: 100
-Random seed: 42
-Device: cuda:0
-Output directory: ./my_protein_results/generated_protein_150_20250919_193136
-Timestamp: 20250919_193136
