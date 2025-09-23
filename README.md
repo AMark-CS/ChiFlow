@@ -1,7 +1,7 @@
 # Torus Flow Matching for Protein Backbone Generation
 
 
-**Torus Flow Matching** is a generative model for protein design that focuses on dihedral angles, leveraging the toroidal geometry of these angles. This approach is part of the broader **FoldFlow** framework and introduces a specialized flow matching technique tailored for the torus manifold. For more information, please contact hhhzhchhh939@gmail.com
+**Torus Flow Matching** is a generative model for protein design that focuses on dihedral angles, leveraging the toroidal geometry of these angles. This approach is part of the broader **FoldFlow** framework and introduces a specialized flow matching technique tailored for the torus manifold.
 
 # Installation
 To use the Torus Flow Matching model, follow these steps to set up the environment:
