@@ -1,7 +1,7 @@
 # Configuration for inference on ChiFlow experiments using high-dimensional torus flow + NERF.
 defaults:
   - base
-  - override model: torus  # Use ChiFlow model configuration
+  - override model: benchmark  # Use ChiFlow model configuration
   - _self_
 
 experiment:
@@ -19,7 +19,7 @@ inference:
   output_dir: ./results
 
   # Path to model weights.
-  weights_path: ./ckpt/baseline/step_14000.pth
+  weights_path: /root/autodl-fs/ChiFlow/ckpt/ff1/foldflow-sfm.pth
 
   flow:
     # Number of steps for torus flow sampling.

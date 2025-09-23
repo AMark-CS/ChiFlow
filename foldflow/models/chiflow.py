@@ -395,10 +395,13 @@ class ChiFlowModel(nn.Module):
     """
     Complete ChiFlow model for chiral-aware protein backbone generation.
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg, stochastic_paths=False):
         super().__init__()
-        self.flow_matcher = ChiFlowMatcher(cfg)
         self.cfg = cfg
+        # Allow overriding stochastic_paths during inference
+        if hasattr(self.cfg, 'stochastic_paths'):
+            self.cfg.stochastic_paths = stochastic_paths
+        self.flow_matcher = ChiFlowMatcher(cfg)
 
     def forward(self, batch, t=None):
         # Keep interface unchanged for external callers

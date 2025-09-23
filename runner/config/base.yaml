@@ -2,7 +2,7 @@
 defaults:
   - data: default
   - flow_matcher: default
-  - model: torus
+  - model: benchmark
   - experiment: baseline
   - local: null
   - wandb: default

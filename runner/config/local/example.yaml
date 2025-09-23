@@ -19,13 +19,17 @@ experiment:
   separate_rot_loss: True
   use_ddp: False
   num_gpus: 1
-  batch_size: 8
+  batch_size: 16
   num_epoch: 2000
   ckpt_freq: 500
   eval_freq: 250
+  # Added for designability / diversity fraction logging
+  designability_tm_thresh: 0.5        # TM-score threshold for counting a design as designable
+  diversity_rmsd_thresh: 5.0          # CA RMSD (Å) threshold for diversity pair counting
+  diversity_max_samples: 40           # Max samples used to compute diversity (O(N^2))
 
 flow_matcher:
-  stochastic_paths: False
+  stochastic_paths: True
 
 
 wandb:

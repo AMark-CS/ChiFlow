@@ -7,7 +7,7 @@ use_ddp : False
 
 # Training arguments
 log_freq: 100
-batch_size: 128
+batch_size: 512
 eval_batch_size: ${data.samples_per_eval_length}
 num_loader_workers: 2
 torch_num_threads: 4

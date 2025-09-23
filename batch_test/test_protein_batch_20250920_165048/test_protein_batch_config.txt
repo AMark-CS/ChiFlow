@@ -1,0 +1,9 @@
+ChiFlow Batch Inference Configuration
+===================================
+Sequence length: 100
+Sampling steps: 50
+Number of samples: 50
+Base random seed: 42
+Device: cuda:0
+Base output directory: ./batch_test/test_protein_batch_20250920_165048
+Timestamp: 20250920_165048

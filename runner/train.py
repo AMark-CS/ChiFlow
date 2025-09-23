@@ -1,6 +1,27 @@
-"""Pytorch script for training FoldFlow."""
+"""Pytorch script for training FoldFlow.
+
+Enhancements:
+ - Added real-time logging of designability_fraction and diversity_fraction to Weights & Biases.
+     * designability_fraction: fraction of evaluated samples whose tm_score >= designability_tm_thresh.
+     * diversity_fraction: fraction of pairwise CA-RMSD distances (between generated samples) >= diversity_rmsd_thresh.
+         (Computed on CA atoms; O(N^2); capped by diversity_max_samples or lightweight subset size.)
+ - Full evaluation steps compute fractions from the full eval set.
+ - Between full evals, a lightweight fraction evaluation (configurable) runs periodically on a
+     small validation subset so curves update in near real-time.
+Config additions (add under experiment in YAML):
+    designability_tm_thresh: 0.5        # TM-score threshold used for designability_fraction
+    diversity_rmsd_thresh: 5.0          # CA RMSD threshold for diversity_fraction
+    diversity_max_samples: 40           # Max samples for diversity pairwise RMSD (full eval)
+    fraction_eval_freq: 200             # Lightweight fraction eval frequency (steps); 0 disables real-time eval
+    fraction_eval_num_samples: 8        # Number of validation samples used in lightweight fraction eval
+Notes:
+    - If fraction_eval_freq divides the global step and no full evaluation occurs, the lightweight
+      evaluation runs and updates cached fraction metrics.
+    - Cached fraction metrics are logged every step (if available) so wandb curves are continuous.
+"""
 import os
 import torch.multiprocessing as mp
+import torch  # Added missing torch import
 
 # Set the multiprocessing start method to 'spawn' to resolve CUDA initialization issues in forked subprocesses.
 mp.set_start_method('spawn', force=True)
@@ -11,6 +32,7 @@ os.environ["GEOMSTATS_BACKEND"] = "pytorch"
 import copy
 import logging
 import time
+from functools import lru_cache
 from collections import defaultdict, deque
 
 import GPUtil
@@ -20,6 +42,7 @@ import pandas as pd
 import torch
 import tree
 import wandb
+import mdtraj as md  # used for diversity RMSD calculations
 from einops import rearrange
 import foldflow.utils.experiments_utils as eu
 from hydra.core.hydra_config import HydraConfig
@@ -121,6 +144,17 @@ class Experiment:
             # For SE3 models, use SE3FlowMatcher
             self._flow_matcher = se3_fm.SE3FlowMatcher(self._fm_conf)
 
+        # Thresholds for new fraction metrics (allow missing in older configs)
+        self._designability_tm_thresh = getattr(self._exp_conf, "designability_tm_thresh", 0.5)
+        self._diversity_rmsd_thresh = getattr(self._exp_conf, "diversity_rmsd_thresh", 5.0)
+        self._diversity_max_samples = getattr(self._exp_conf, "diversity_max_samples", 40)
+        # Lightweight (real-time) fraction evaluation settings (default every 200 steps)
+        self._fraction_eval_freq = getattr(self._exp_conf, "fraction_eval_freq", 200)
+        self._fraction_eval_num_samples = getattr(self._exp_conf, "fraction_eval_num_samples", 8)
+        # Cached latest fractions for logging each step (even when not recomputed)
+        self._last_designability_fraction = None
+        self._last_diversity_fraction = None
+
         self._model = model
         if self._model is None:
             if self._model_conf.model_name == "chiflow":
@@ -154,20 +188,42 @@ class Experiment:
 
         if self._exp_conf.full_ckpt_dir is not None:
             # Set-up checkpoint location
-            ckpt_dir = self._exp_conf.full_ckpt_dir
-            if not os.path.exists(ckpt_dir):
-                os.makedirs(ckpt_dir, exist_ok=True)
-            self._exp_conf.full_ckpt_dir = ckpt_dir
-            self._log.info(f"Checkpoints saved to: {ckpt_dir}")
+            # Original config gives something like ./ckpt/<name>/
+            base_ckpt_dir = self._exp_conf.full_ckpt_dir
+            # Ensure base dir exists
+            os.makedirs(base_ckpt_dir, exist_ok=True)
+            # Per-run timestamped subdirectory
+            run_start_time = time.strftime("%Y%m%d_%H%M%S")
+            run_ckpt_dir = os.path.join(base_ckpt_dir, run_start_time)
+            os.makedirs(run_ckpt_dir, exist_ok=True)
+            # Update config to point to run-specific directory
+            self._exp_conf.full_ckpt_dir = run_ckpt_dir
+            self._log.info(f"Checkpoints saved to per-run directory: {run_ckpt_dir}")
+            # Create/refresh a symlink 'latest' inside base_ckpt_dir pointing to this run for convenience
+            latest_link = os.path.join(base_ckpt_dir, 'latest')
+            try:
+                if os.path.islink(latest_link) or os.path.exists(latest_link):
+                    if os.path.islink(latest_link):
+                        os.unlink(latest_link)
+                    else:
+                        # If a normal dir/file named latest exists, skip to avoid accidental deletion
+                        self._log.warning(f"Cannot create latest symlink, path exists and is not a symlink: {latest_link}")
+                if not os.path.exists(latest_link):
+                    os.symlink(run_ckpt_dir, latest_link)
+            except OSError as e:
+                self._log.warning(f"Failed to create latest symlink: {e}")
         else:
             self._log.info("Checkpoint not being saved.")
         if self._exp_conf.eval_dir is not None:
-            eval_dir = os.path.join(
-                self._exp_conf.eval_dir,
-                self._exp_conf.name,
-                self.conf.start_time_string,
-            )
+            # Mirror the timestamped run directory name for eval outputs for easier association
+            # Reuse the same run_start_time if we created one above; otherwise create a new timestamp
+            if 'run_ckpt_dir' in locals():
+                run_timestamp = os.path.basename(run_ckpt_dir)
+            else:
+                run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+            eval_dir = os.path.join(self._exp_conf.eval_dir, self._exp_conf.name, run_timestamp)
             self._exp_conf.eval_dir = eval_dir
+            os.makedirs(eval_dir, exist_ok=True)
             self._log.info(f"Evaluation saved to: {eval_dir}")
         else:
             self._exp_conf.eval_dir = os.devnull
@@ -335,6 +391,9 @@ class Experiment:
         self._log.info(
             f"Wandb: run_id={self._exp_conf.run_id}, run_dir={self._wandb_conf.dir}"
         )
+        # Define fraction metrics after Wandb init
+        wandb.define_metric("designability_fraction", step_metric="_step")
+        wandb.define_metric("diversity_fraction", step_metric="_step")
 
     def start_training(self, return_logs=False):
         # print(f"Start-training-"*10)
@@ -568,6 +627,14 @@ class Experiment:
                 example_per_sec = self._exp_conf.batch_size / step_time
                 step_time = time.time()
 
+                # Lightweight fraction evaluation (only if no full eval this step)
+                if (
+                    self._fraction_eval_freq > 0
+                    and self.trained_steps % self._fraction_eval_freq == 0
+                    and ckpt_metrics is None  # skip if full eval already computed fractions
+                ):
+                    self._lightweight_fraction_eval(valid_loader, device)
+
                 if self._model_conf.model_name == "chiflow":
                     # ChiFlow specific logging
                     wandb_logs = {
@@ -640,6 +707,30 @@ class Experiment:
                         eval_table.add_data(*row_metrics)
                     wandb_logs["sample_metrics"] = eval_table
 
+                    # --- Designability Fraction ---
+                    if "tm_score" in ckpt_metrics.columns:
+                        designability_fraction = (ckpt_metrics["tm_score"] >= self._designability_tm_thresh).mean()
+                        wandb_logs["designability_fraction"] = designability_fraction
+
+                    # --- Diversity Fraction ---
+                    # Compute fraction of pairwise CA RMSDs >= threshold.
+                    # Limit number of samples for O(N^2) computation.
+                    sample_paths = ckpt_metrics["sample_path"].tolist()
+                    if len(sample_paths) >= 2:
+                        diversity_fraction = self._compute_diversity_fraction(
+                            sample_paths,
+                            rmsd_thresh=self._diversity_rmsd_thresh,
+                            max_samples=self._diversity_max_samples,
+                        )
+                        if diversity_fraction is not None:
+                            wandb_logs["diversity_fraction"] = diversity_fraction
+
+                # Always log latest cached fractions (from full or lightweight eval)
+                if self._last_designability_fraction is not None:
+                    wandb_logs.setdefault("designability_fraction", self._last_designability_fraction)
+                if self._last_diversity_fraction is not None:
+                    wandb_logs.setdefault("diversity_fraction", self._last_diversity_fraction)
+
                 wandb.log(wandb_logs, step=self.trained_steps)
 
             if torch.isnan(loss):
@@ -652,6 +743,53 @@ class Experiment:
 
         if return_logs:
             return global_logs
+
+    # ----------------------------------------------------------------------------------
+    # Diversity / Designability helper computations
+    # ----------------------------------------------------------------------------------
+    def _compute_diversity_fraction(self, pdb_paths, rmsd_thresh: float, max_samples: int = 40):
+        """Compute fraction of pairwise CA RMSDs >= threshold.
+
+        Args:
+            pdb_paths: list of PDB file paths.
+            rmsd_thresh: threshold in Angstrom.
+            max_samples: subsample first N structures for efficiency.
+        Returns:
+            diversity_fraction (float) or None if computation failed.
+        """
+        try:
+            if len(pdb_paths) < 2:
+                return None
+            sub_paths = pdb_paths[: max_samples]
+            # Load with mdtraj
+            trajs = [md.load(p) for p in sub_paths]
+            # Align atom selections: take CA atoms only
+            ca_trajs = [t.atom_slice([a.index for a in t.topology.atoms if a.name == "CA"]) for t in trajs]
+            # Ensure consistent residue counts
+            min_len = min(t.n_atoms for t in ca_trajs)
+            if min_len == 0:
+                return None
+            trimmed = [t.atom_slice(range(min_len)) for t in ca_trajs]
+            # Stack coordinates
+            coords = [t.xyz[0] for t in trimmed]  # list of (N_ca,3)
+            n = len(coords)
+            pair_total = 0
+            pair_pass = 0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Superpose i onto j (Kabsch) using mdtraj superpose semantics
+                    # Create shallow copies to avoid modifying originals
+                    ti = trimmed[i].superpose(trimmed[j])
+                    rmsd_val = md.rmsd(ti, trimmed[j])[0]  # single frame
+                    pair_total += 1
+                    if rmsd_val >= rmsd_thresh:
+                        pair_pass += 1
+            if pair_total == 0:
+                return None
+            return pair_pass / pair_total
+        except Exception as e:
+            self._log.warning(f"Diversity fraction computation failed: {e}")
+            return None
 
     def eval_fn(
         self,
@@ -747,6 +885,91 @@ class Experiment:
         ckpt_eval_metrics = pd.DataFrame(ckpt_eval_metrics)
         ckpt_eval_metrics.to_csv(eval_metrics_csv_path, index=False)
         return ckpt_eval_metrics
+
+    # ----------------------------------------------------------------------------------
+    # Lightweight real-time fraction evaluation (subset of validation set)
+    # ----------------------------------------------------------------------------------
+    def _lightweight_fraction_eval(self, valid_loader, device):
+        """Run a fast evaluation on a small subset to update fraction metrics.
+
+        Strategy:
+          - Take up to self._fraction_eval_num_samples batches (accumulating samples) until reaching target count.
+          - Run inference (single reverse trajectory) to produce final structures.
+          - Compute TM-score vs ground-truth for each sample (designability proxy).
+          - Save temporary PDB files in a temp subdir under eval_dir (if available) or /tmp.
+          - Reuse existing diversity fraction function on produced sample paths.
+        """
+        if self._fraction_eval_freq <= 0:
+            return  # feature disabled
+        try:
+            import tempfile, shutil
+            from tools.analysis import metrics as metrics_mod
+            import mdtraj as md  # ensure available
+            # Collect samples
+            collected = 0
+            sample_paths = []
+            tm_scores = []
+            temp_root = tempfile.mkdtemp(prefix="fraction_eval_")
+            for valid_feats, pdb_names in valid_loader:
+                if collected >= self._fraction_eval_num_samples:
+                    break
+                batch_size = valid_feats["res_mask"].shape[0]
+                take = min(batch_size, self._fraction_eval_num_samples - collected)
+                # Slice to take only needed
+                slice_feats = tree.map_structure(lambda x: x[:take].to(device) if torch.is_tensor(x) else x[:take], valid_feats)
+                # ChiFlow special preparation
+                if self._model_conf.model_name == "chiflow":
+                    torsion_sin_cos = slice_feats['torsion_angles_sin_cos'][:, :, :3, :]
+                    dihedrals = torch.atan2(torsion_sin_cos[..., 0], torsion_sin_cos[..., 1])
+                    slice_feats['dihedrals'] = dihedrals
+                    noisy_result = self._flow_matcher.dihedral_forward_marginal(dihedrals, 1.0, flow_mask=None)
+                    slice_feats['dihedrals_t'] = noisy_result['dihedrals_t']
+                infer_out = self.inference_fn(slice_feats, noise_scale=self._exp_conf.noise_scale)
+                final_prot = infer_out["prot_traj"][0] # (B, L, 37, 3) at t=0
+                res_mask = du.move_to_np(slice_feats["res_mask"].bool())
+                aatype = du.move_to_np(slice_feats["aatype"]) if "aatype" in slice_feats else None
+                gt_prot = du.move_to_np(slice_feats["atom37_pos"]) if "atom37_pos" in slice_feats else None
+                for i in range(take):
+                    num_res = int(np.sum(res_mask[i]).item())
+                    unpad_prot = final_prot[i][res_mask[i]]
+                    gt_atom37 = gt_prot[i][res_mask[i]] if gt_prot is not None else None
+                    prot_path = os.path.join(temp_root, f"len_{num_res}_sample_{collected+i}.pdb")
+                    # Reuse writer (with minimal args)
+                    au.write_prot_to_pdb(unpad_prot, prot_path, no_indexing=True)
+                    sample_paths.append(prot_path)
+                    if gt_atom37 is not None and aatype is not None:
+                        try:
+                            sample_metrics = metrics_mod.protein_metrics(
+                                pdb_path=prot_path,
+                                atom37_pos=unpad_prot,
+                                gt_atom37_pos=gt_atom37,
+                                gt_aatype=aatype[i][res_mask[i]],
+                                flow_mask=np.ones(num_res),
+                            )
+                            if 'tm_score' in sample_metrics:
+                                tm_scores.append(sample_metrics['tm_score'])
+                        except Exception:
+                            pass
+                collected += take
+            # Designability fraction
+            if tm_scores:
+                self._last_designability_fraction = float(
+                    (np.array(tm_scores) >= self._designability_tm_thresh).mean()
+                )
+            # Diversity fraction
+            if len(sample_paths) >= 2:
+                diversity_fraction = self._compute_diversity_fraction(
+                    sample_paths,
+                    rmsd_thresh=self._diversity_rmsd_thresh,
+                    max_samples=min(self._diversity_max_samples, len(sample_paths)),
+                )
+                if diversity_fraction is not None:
+                    self._last_diversity_fraction = float(diversity_fraction)
+            # Cleanup
+            shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception as e:
+            self._log.warning(f"Lightweight fraction eval failed: {e}")
+            return
 
     def _prepare_chiflow_batch(self, batch):
         """Prepare batch data for ChiFlow model.
@@ -1138,6 +1361,7 @@ class Experiment:
                     center=center,
                     noise_scale=noise_scale,
                 )
+
 
                 sample_feats["rigids_t"] = rigids_t.to_tensor_7().to(device)
                 if aux_traj:

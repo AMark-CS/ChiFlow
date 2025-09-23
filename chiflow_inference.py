@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Add project root to path
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
 from foldflow.models.chiflow import ChiFlowModel
@@ -36,15 +36,75 @@ class ChiFlowInference:
         print(f"Random seed: {config.seed}")
 
     def load_model(self):
-        """Load ChiFlow model."""
-        print(f"Loading model from: {self.config.weights_path}")
+        """Load ChiFlow model from checkpoint."""
+        weights_path = self.config.weights_path
+        if not weights_path or not os.path.exists(weights_path):
+            print("⚠ No checkpoint provided or path is invalid, using random initialization.")
+            # Fallback to default config for random initialization
+            cfg = self._create_default_config()
+            self.model = ChiFlowModel(cfg).to(self.device).eval()
+            return
 
-        # Create model configuration
+        print(f"Loading model from: {weights_path}")
+        
+        # Ensure path is absolute
+        weights_path = os.path.abspath(weights_path)
+        print(f"Attempting to load weights from absolute path: {weights_path}")
+
+        # Load checkpoint
+        checkpoint = torch.load(weights_path, map_location=self.device, weights_only=False)
+
+        # Load config from checkpoint if available
+        cfg = self._create_default_config()
+        stochastic_paths = False  # Default value
+        
+        if 'conf' in checkpoint:
+            print("✓ Model configuration loaded from checkpoint.")
+            loaded_cfg = checkpoint['conf']
+            # Merge loaded config into default config
+            for key, value in loaded_cfg.items():
+                setattr(cfg, key, value)
+            
+            # Safely get stochastic_paths if it exists
+            if 'stochastic_paths' in loaded_cfg:
+                stochastic_paths = loaded_cfg.stochastic_paths
+        elif 'cfg' in checkpoint:
+            print("✓ Model configuration loaded from checkpoint.")
+            loaded_cfg = checkpoint['cfg']
+            # Merge loaded config into default config
+            for key, value in loaded_cfg.items():
+                setattr(cfg, key, value)
+
+            # Safely get stochastic_paths if it exists
+            if 'stochastic_paths' in loaded_cfg:
+                stochastic_paths = loaded_cfg.stochastic_paths
+        else:
+            print("⚠ No configuration found in checkpoint, using default inference config.")
+            # cfg is already the default config
+
+        # Create model with the loaded or default configuration
+        self.model = ChiFlowModel(cfg, stochastic_paths=stochastic_paths)
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        # Load model state dict
+        if 'model' in checkpoint:
+            try:
+                self.model.load_state_dict(checkpoint['model'], strict=False)
+                print("✓ Model weights loaded successfully")
+            except RuntimeError as e:
+                print(f"❌ Error loading state_dict: {e}")
+                print("Retrying with strict=False might help if some layers are missing.")
+        else:
+            print("⚠ No model weights ('model' key) found in checkpoint, using random initialization.")
+
+    def _create_default_config(self):
+        """Creates a default model configuration for inference."""
         class ModelConfig:
             def __init__(self):
                 self.n_context_dims = 256
-                self.residue_feat_dim = 256  # Match training config
-                self.pair_feat_dim = 128     # Match training config
+                self.residue_feat_dim = 256
+                self.pair_feat_dim = 128
                 self.num_aa_types = 21
                 self.time_embed_dim = 64
                 self.flow = type('FlowConfig', (), {
@@ -52,41 +112,22 @@ class ChiFlowInference:
                     'num_hidden_layers': 4,
                     'num_mixtures': 3
                 })()
-                # Add missing encoder configurations
                 self.residue_encoder = type('ResidueEncoder', (), {
                     'num_aa_types': 21,
-                    'feat_dim': 256,  # Match residue_feat_dim
+                    'feat_dim': 256,
                     'max_num_atoms': 37
                 })()
                 self.pair_encoder = type('PairEncoder', (), {
-                    'feat_dim': 128,  # Match pair_feat_dim
+                    'feat_dim': 128,
                     'max_num_residues': 512
                 })()
-                # Add other missing attributes
                 self.mirror_constraint_weight = 0.1
                 self.use_mirror_constraint = True
                 self.ot_plan = False
                 self.ot_fn = 'exact'
                 self.reg = 0.05
                 self.stochastic_paths = False
-
-        cfg = ModelConfig()
-
-        # Create model
-        self.model = ChiFlowModel(cfg)
-        self.model = self.model.to(self.device)
-        self.model.eval()
-
-        # Load checkpoint if provided
-        if self.config.weights_path and os.path.exists(self.config.weights_path):
-            checkpoint = torch.load(self.config.weights_path, map_location=self.device, weights_only=False)
-            if 'model' in checkpoint:
-                self.model.load_state_dict(checkpoint['model'], strict=False)
-                print("✓ Model weights loaded successfully")
-            else:
-                print("⚠ No model weights found in checkpoint, using random initialization")
-        else:
-            print("⚠ No checkpoint provided, using random initialization")
+        return ModelConfig()
 
     def create_batch(self, sequence_length):
         """Create input batch for inference."""
@@ -294,6 +335,10 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Resolve weights_path to an absolute path to be independent of CWD
+    if args.weights_path:
+        args.weights_path = os.path.abspath(args.weights_path)
 
     # Validate arguments
     if args.length <= 0:
